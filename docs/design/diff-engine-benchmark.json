@@ -1,0 +1,120 @@
+{
+  "date": "2026-11-13",
+  "hardware": "Apple M5",
+  "os": "27.2.1",
+  "git": "git version 2.54.0",
+  "swift": "6.4.2, swiftc -O",
+  "textdiff_revision": "b5815ad2cf18a875776ff4b4f124bbdfb2134b1d",
+  "repeats": 3,
+  "rows": [
+    {
+      "lines": 1000,
+      "change": "sparse",
+      "bytes": 37000,
+      "engine": "git-histogram",
+      "status": "ok",
+      "median_ms": 8.723,
+      "notes": "includes process startup, read and patch output capture"
+    },
+    {
+      "lines": 1000,
+      "change": "sparse",
+      "bytes": 37000,
+      "engine": "swift-lines",
+      "status": "ok",
+      "median_ms": 0.186,
+      "notes": "in-process difference(from:) plus applying reconstruction validation; file read, line splitting, process startup and hunk generation excluded"
+    },
+    {
+      "lines": 1000,
+      "change": "sparse",
+      "bytes": 37000,
+      "engine": "textdiff-tokens",
+      "status": "ok",
+      "median_ms": 5.019,
+      "notes": "in-process engine diff including word tokenization; file read, process startup and rendering excluded; output differs from line-based engines"
+    },
+    {
+      "lines": 10000,
+      "change": "sparse",
+      "bytes": 370000,
+      "engine": "git-histogram",
+      "status": "ok",
+      "median_ms": 5.974,
+      "notes": "includes process startup, read and patch output capture"
+    },
+    {
+      "lines": 10000,
+      "change": "sparse",
+      "bytes": 370000,
+      "engine": "swift-lines",
+      "status": "ok",
+      "median_ms": 0.648,
+      "notes": "in-process difference(from:) plus applying reconstruction validation; file read, line splitting, process startup and hunk generation excluded"
+    },
+    {
+      "lines": 10000,
+      "change": "sparse",
+      "bytes": 370000,
+      "engine": "textdiff-tokens",
+      "status": "ok",
+      "median_ms": 26.884,
+      "notes": "in-process engine diff including word tokenization; file read, process startup and rendering excluded; output differs from line-based engines"
+    },
+    {
+      "lines": 100000,
+      "change": "sparse",
+      "bytes": 3700000,
+      "engine": "git-histogram",
+      "status": "ok",
+      "median_ms": 21.039,
+      "notes": "includes process startup, read and patch output capture"
+    },
+    {
+      "lines": 100000,
+      "change": "sparse",
+      "bytes": 3700000,
+      "engine": "swift-lines",
+      "status": "ok",
+      "median_ms": 6.165,
+      "notes": "in-process difference(from:) plus applying reconstruction validation; file read, line splitting, process startup and hunk generation excluded"
+    },
+    {
+      "lines": 1000,
+      "change": "rewrite",
+      "bytes": 37000,
+      "engine": "git-histogram",
+      "status": "ok",
+      "median_ms": 4.459,
+      "notes": "includes process startup, read and patch output capture"
+    },
+    {
+      "lines": 1000,
+      "change": "rewrite",
+      "bytes": 37000,
+      "engine": "swift-lines",
+      "status": "ok",
+      "median_ms": 21.06,
+      "notes": "in-process difference(from:) plus applying reconstruction validation; file read, line splitting, process startup and hunk generation excluded"
+    },
+    {
+      "lines": 10000,
+      "change": "rewrite",
+      "bytes": 370000,
+      "engine": "git-histogram",
+      "status": "ok",
+      "median_ms": 7.699,
+      "notes": "includes process startup, read and patch output capture"
+    },
+    {
+      "lines": 10000,
+      "change": "rewrite",
+      "bytes": 370000,
+      "engine": "swift-lines",
+      "status": "ok",
+      "median_ms": 1708.592,
+      "notes": "in-process difference(from:) plus applying reconstruction validation; file read, line splitting, process startup and hunk generation excluded"
+    }
+  ],
+  "limitations": "Synthetic inputs, three repeats, no UI rendering or peak memory measured; different output granularities and timing boundaries."
+}

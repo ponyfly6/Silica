@@ -51,6 +51,8 @@
 
 审阅采用 **写入后审阅**。界面显示“已修改”，不提供容易误解为尚未落盘的“接受全部”按钮。“已查看”只记录审阅状态，不修改文件。
 
+基础 diff 采用 **Git histogram 计算 + AppKit 原生只读显示**。先做统一格式、前后行号、增删背景色与 3 行上下文；保留选择和复制，不加入三方合并或逐块接受。`git diff --no-index` 比较任务前后快照，不要求项目本身受 Git 管理；诊断必须检查 Git 可执行文件。计算、解析与渲染分离，后续确有需要再评估内置 libgit2。候选审查、本机计时和适配边界见 [diff-engine-evaluation.md](diff-engine-evaluation.md)。
+
 ## Codex 接入决定
 
 链路：`SwiftUI → AgentSessionModel → ACPClient → stdio codex-acp → Codex App Server`。
