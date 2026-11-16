@@ -382,6 +382,10 @@ final class TextController: NSObject, NSTextViewDelegate {
     /// leaves the buffer clean. Only the differing middle is replaced, so the
     /// selection and scroll position stay put when the change is elsewhere.
     func replaceText(with newText: String) {
+        // Disk synchronization is allowed while user editing is protected by an agent lease.
+        let wasEditable = textView.isEditable
+        textView.isEditable = true
+        defer { textView.isEditable = wasEditable }
         let old = textView.string as NSString
         let new = newText as NSString
         let shared = min(old.length, new.length)

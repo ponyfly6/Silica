@@ -2,7 +2,40 @@
 
 This development fork of [dqhieu/Silica](https://github.com/dqhieu/Silica) is building
 a native agent workbench. It uses a separate app identity and does not check the
-upstream Sparkle feed. Codex/ACP integration is planned; it is not connected yet.
+upstream Sparkle feed. Codex connects through the pinned ACP adapter.
+
+## Codex tasks and turn review
+
+Install Node.js and sign in with `codex login`, then install the pinned adapter:
+
+```sh
+bash scripts/install-codex-acp.sh
+```
+
+Open a project in the development app and press **⇧⌘A**. Send a question or task;
+the panel connects automatically using your existing Codex login. Model, reasoning
+effort and workspace/read-only mode come from the backend. Commands show their
+output and exit status; permission requests require an explicit choice. **Stop**
+cancels the task; **End Connection** becomes available if cancellation stalls.
+
+Each task captures project files before and after execution. Click a file under
+**Observed this turn** to open its frozen native diff. **Open File** opens today's
+version so you can edit, save and continue in the same chat. Previous turn diffs
+stay unchanged. Existing disk edits are part of the baseline, not attributed to
+the next task. Unsaved project buffers must be saved before execution, and editing
+is protected across overlapping project windows while the task runs.
+
+This preview retains chat and review history in the window only (20 turns / 100 MiB
+of retained review contents). Closing the window or starting a new chat clears it.
+Disconnect/reconnect within the window uses ACP `session/load`. There are no
+automatic retries, full-access mode, or whole-turn revert actions.
+
+Capture covers tracked and non-ignored untracked files, with a non-Git fallback.
+External symlink contents and ignored files are excluded; text retention is limited
+to 1 MiB per file and 50 MiB per snapshot. Binary/oversized files show limitations.
+Concurrent external edits can appear in the observed changes. Discovery is bounded
+to 20,000 files and fails explicitly when a reliable baseline cannot be captured.
+The app does not retain credentials; the adapter manages its own login and sandbox.
 
 ## Native file review
 
@@ -14,7 +47,7 @@ the editor; **Refresh** compares the latest editor contents, including unsaved e
 The baseline is captured when a file is opened. Saving or external disk refreshes
 do not replace it. **Reset Baseline** (also Editor › Set File Review Baseline) uses
 the current editor version instead. Baselines live for the open tab only; these
-are file comparisons, not yet per-agent-turn project checkpoints.
+are separate from the frozen project snapshots attached to Codex turns.
 
 Comparison uses an installed Git executable with `diff --no-index`, even outside a
 Git repository. Each text version is limited to 1 MiB, the displayed patch to
@@ -25,7 +58,15 @@ Build with the existing Silica scheme. Core diff checks run with:
 
 ```sh
 bash scripts/test-review.sh
+bash scripts/test-agent.sh
+# Optional: uses your Codex account on disposable synthetic projects.
+RUN_LIVE_CODEX_TESTS=1 bash scripts/test-agent-live.sh
 ```
+
+The adapter is pinned to `@agentclientprotocol/codex-acp@2.6.0` in
+`Tools/CodexACP/package-lock.json`; development validation used Codex 0.166.0.
+Protocol decisions and the Zed references are recorded in
+[the integration notes](docs/design/codex-acp-integration.md).
 
 Design and implementation milestones are in [docs/design](docs/design/agent-workbench-v1.md).
 The description below documents the upstream editor foundation. Upstream downloads

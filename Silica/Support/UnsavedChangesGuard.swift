@@ -55,7 +55,7 @@ struct UnsavedChangesGuard: NSViewRepresentable {
             guard let window, proxy == nil || window.delegate !== proxy else { return }
             let proxy = WindowDelegateProxy(
                 original: window.delegate,
-                needsConfirmation: { [weak self] in self?.workspace?.hasUnsavedChanges == true },
+                needsConfirmation: { [weak self] in self?.workspace?.needsCloseConfirmation == true },
                 confirm: { [weak self] window, proceed in
                     guard let workspace = self?.workspace else { return proceed(true) }
                     workspace.confirmClosing(in: window, completion: proceed)
@@ -76,7 +76,7 @@ struct UnsavedChangesGuard: NSViewRepresentable {
         static var hasUnsavedChanges: Bool { !pending.isEmpty }
 
         private static var pending: [GuardView] {
-            all.allObjects.filter { $0.window != nil && $0.workspace?.hasUnsavedChanges == true }
+            all.allObjects.filter { $0.window != nil && $0.workspace?.needsCloseConfirmation == true }
         }
 
         private static func confirm(_ views: ArraySlice<GuardView>, completion: @escaping (Bool) -> Void) {

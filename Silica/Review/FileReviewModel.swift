@@ -16,14 +16,19 @@ final class FileReviewModel {
     let url: URL
     let baseline: FileReviewBaseline
     let updated: String
-    let comparedAt = Date()
+    let comparedAt: Date
+    let title: String
+    let isFrozen: Bool
+    let notice: String?
     private(set) var state: State = .loading
     @ObservationIgnored private var task: Task<Void, Never>?
 
-    init(url: URL, baseline: FileReviewBaseline, updated: String) {
+    init(url: URL, baseline: FileReviewBaseline, updated: String, title: String = "File Review", isFrozen: Bool = false,
+         notice: String? = nil, comparedAt: Date = .now) {
         self.url = url
         self.baseline = baseline
         self.updated = updated
+        self.title = title; self.isFrozen = isFrozen; self.notice = notice; self.comparedAt = comparedAt
         task = Task { [weak self] in
             let worker = Task.detached(priority: .userInitiated) {
                 try GitDiffEngine.compare(original: baseline.text, updated: updated)

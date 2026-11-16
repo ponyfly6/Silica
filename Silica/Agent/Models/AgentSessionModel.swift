@@ -1,0 +1,319 @@
+import Foundation
+import Observation
+
+@Observable
+final class AgentSessionModel {
+    var draft = ""
+    var executablePath = UserDefaults.standard.string(forKey: "codexACPExecutable") ?? "" {
+        didSet { UserDefaults.standard.set(executablePath, forKey: "codexACPExecutable") }
+    }
+    private(set) var isConnected = false
+    private(set) var isConnecting = false
+    private(set) var isBusy = false
+    private(set) var isStopping = false
+    private(set) var canForceDisconnect = false
+    private(set) var errorMessage: String?
+    private(set) var agentVersion = ""
+    private(set) var turns: [AgentTurn] = []
+    private(set) var permissions: [AgentPermission] = []
+    private(set) var configOptions: [AgentConfigOption] = []
+    private(set) var preparationStatus = ""
+    @ObservationIgnored private weak var workspace: WorkspaceModel?
+    @ObservationIgnored private let transport = ACPTransport()
+    @ObservationIgnored private var operation: Task<Void, Never>?
+    @ObservationIgnored private var flushTask: Task<Void, Never>?
+    @ObservationIgnored private var stopTimer: Task<Void, Never>?
+    @ObservationIgnored private var pendingUpdates: [ACPJSON] = []
+    @ObservationIgnored private var currentTurn: AgentTurn?
+    @ObservationIgnored private var sessionID: String?
+    @ObservationIgnored private var closed = false
+
+    init(workspace: WorkspaceModel) {
+        self.workspace = workspace
+        transport.onNotification = { [weak self] method, params in self?.receive(method, params: params) }
+        transport.onRequest = { [weak self] method, id, params in self?.handleRequest(method, id: id, params: params) }
+        transport.onDisconnect = { [weak self] message in
+            guard let self else { return }
+            self.flushUpdates()
+            self.isConnected = false
+            self.errorMessage = message
+            self.cancelPermissions()
+            self.operation?.cancel()
+        }
+    }
+
+    var statusLabel: String {
+        if isStopping { return "Stopping…" }
+        if let currentTurn, isBusy { return currentTurn.status }
+        if isConnecting { return "Connecting…" }
+        if isBusy { return preparationStatus.isEmpty ? "Preparing…" : preparationStatus }
+        return isConnected ? "Connected" : "Disconnected"
+    }
+
+    func connect() {
+        guard !isBusy, !isConnecting else { return }
+        operation = Task { [weak self] in
+            do { try await self?.establishConnection() }
+            catch { self?.errorMessage = error.localizedDescription; self?.transport.close(); self?.isConnected = false }
+        }
+    }
+
+    private func establishConnection() async throws {
+        if isConnected { return }
+        guard !closed, let workspace else { throw CancellationError() }
+        guard let executable = CodexRuntime.find(configuredPath: executablePath) else {
+            throw ACPError.message("Codex ACP was not found. Run scripts/install-codex-acp.sh from the checkout, or choose an installed codex-acp executable below. Node.js is required for the npm runtime.")
+        }
+        isConnecting = true; errorMessage = nil
+        defer { isConnecting = false }
+        try transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath())
+        let initialized = try await transport.request("initialize", params: .object([
+            "protocolVersion": .number(1),
+            "clientInfo": .object(["name": .string("silica-workbench"), "title": .string("Silica Workbench"), "version": .string("0.1.0")]),
+            "clientCapabilities": .object(["fs": .object(["readTextFile": .bool(false), "writeTextFile": .bool(false)]),
+                                           "terminal": .bool(false), "_meta": .object(["terminal_output": .bool(true), "terminal_output_delta": .bool(true)])])
+        ]), timeout: .seconds(20))
+        guard initialized["protocolVersion"].integer == 1 else { throw ACPError.message("The adapter did not negotiate ACP v1.") }
+        agentVersion = initialized["agentInfo"]["version"].string ?? "unknown"
+        let response: ACPJSON
+        if let sessionID, initialized["agentCapabilities"]["loadSession"].boolean {
+            response = try await transport.request("session/load", params: .object([
+                "sessionId": .string(sessionID), "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
+            ]))
+        } else {
+            response = try await transport.request("session/new", params: .object([
+                "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
+            ]))
+            guard let id = response["sessionId"].string else { throw ACPError.message("Codex did not create a session. Run codex login, then reconnect.") }
+            sessionID = id
+        }
+        configOptions = AgentConfigOption.parse(response["configOptions"])
+        // The pinned adapter advertises these values. Refuse an unexpected broader
+        // mode instead of inheriting a full-access setting from another client.
+        let mode = configOptions.first { $0.category == "mode" }
+        if let mode, !["workspace-write", "read-only"].contains(mode.value) {
+            guard mode.choices.contains(where: { $0.id == "workspace-write" }), let sessionID else {
+                throw ACPError.message("This session did not offer workspace-scoped permissions.")
+            }
+            let adjusted = try await transport.request("session/set_config_option", params: .object([
+                "sessionId": .string(sessionID), "configId": .string(mode.id), "value": .string("workspace-write")
+            ]))
+            configOptions = AgentConfigOption.parse(adjusted["configOptions"])
+        }
+        isConnected = true
+    }
+
+    func setConfiguration(_ option: AgentConfigOption, value: String) {
+        guard !isBusy, !isConnecting, let sessionID, option.choices.contains(where: { $0.id == value }) else { return }
+        if option.category == "mode", !["workspace-write", "read-only"].contains(value) { return }
+        isConnecting = true
+        operation = Task { [weak self] in
+            guard let self else { return }
+            defer { self.isConnecting = false }
+            do {
+                let response = try await transport.request("session/set_config_option", params: .object([
+                    "sessionId": .string(sessionID), "configId": .string(option.id), "value": .string(value)
+                ]))
+                configOptions = AgentConfigOption.parse(response["configOptions"])
+            } catch { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func send() {
+        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isBusy, !isConnecting, !prompt.isEmpty, !closed else { return }
+        guard prompt.utf8.count <= 32_768 else { errorMessage = "Keep a message under 32 KiB."; return }
+        guard turns.count < 20 else { errorMessage = "This preview keeps up to 20 turns in a chat. Start a new chat to continue."; return }
+        isBusy = true; isStopping = false; canForceDisconnect = false; errorMessage = nil
+        preparationStatus = "Preparing…"
+        operation = Task { [weak self] in await self?.runTurn(prompt) }
+    }
+
+    private func runTurn(_ prompt: String) async {
+        guard let workspace else { isBusy = false; return }
+        var lease: UUID?
+        var baseline: TurnSnapshot?
+        var budget = 0
+        let turn = AgentTurn(number: turns.count + 1, prompt: prompt)
+        var failed = false
+        var cancelled = false
+        do {
+            try await establishConnection()
+            try Task.checkCancellation()
+            lease = try AgentWorkspaceCoordinator.shared.acquire(for: workspace)
+            let remaining = 100 * 1_048_576 - turns.reduce(0) { $0 + $1.storedBytes }
+            guard remaining >= 2 * 1_048_576 else { throw ACPError.message("Review snapshot storage is full. Start a new chat before another task.") }
+            budget = min(50 * 1_048_576, remaining / 2)
+            preparationStatus = "Capturing baseline…"
+            let root = workspace.rootURL
+            let captureBudget = budget
+            let worker = Task.detached(priority: .userInitiated) { try TurnSnapshot.capture(root: root, byteBudget: captureBudget) }
+            baseline = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+            try Task.checkCancellation()
+            guard let sessionID, let baseline else { throw ACPError.message("The task baseline or session is missing.") }
+            currentTurn = turn; turns.append(turn); draft = ""
+            turn.baselineCapturedAt = baseline.capturedAt
+            turn.warnings = baseline.warnings
+            turn.status = "Running"
+            let response = try await transport.request("session/prompt", params: .object([
+                "sessionId": .string(sessionID), "prompt": .array([
+                    .object(["type": .string("text"), "text": .string("Workspace: \(root.path). Finish commands before ending the task; this client does not support detached background jobs.\n\n" + prompt)])
+                ])
+            ]), timeout: nil)
+            flushUpdates()
+            // A prompt response is not evidence that a background command exited.
+            while response["stopReason"].string != "cancelled", turn.hasUnfinishedCommands {
+                turn.status = "Waiting for command exit"
+                try await Task.sleep(for: .milliseconds(100))
+                flushUpdates()
+            }
+            switch response["stopReason"].string {
+            case "end_turn": turn.status = "Completed"
+            case "cancelled": turn.status = "Cancelled"; cancelled = true
+            default: turn.status = "Stopped: \(response["stopReason"].string ?? "unknown reason")"
+            }
+        } catch is CancellationError {
+            turn.status = "Cancelled"; failed = true
+        } catch {
+            flushUpdates()
+            turn.status = "Failed"; failed = true
+            errorMessage = error.localizedDescription
+        }
+        stopTimer?.cancel(); stopTimer = nil
+        flushUpdates(); cancelPermissions()
+        if failed || cancelled || isStopping {
+            await transport.shutdown()
+            isConnected = false
+        }
+        if let baseline {
+            if !turns.contains(where: { $0.id == turn.id }) { turns.append(turn) }
+            let finalStatus = turn.status
+            turn.status = "Capturing changes…"
+            do {
+                let root = workspace.rootURL
+                let finalBudget = budget
+                // Capture even after cancellation, retaining the partial files actually on disk.
+                let after = try await Task.detached(priority: .userInitiated) {
+                    try TurnSnapshot.capture(root: root, including: Set(baseline.entries.keys), byteBudget: finalBudget)
+                }.value
+                turn.changes = after.changes(comparedTo: baseline)
+                turn.warnings = Array(Set(turn.warnings + after.warnings)).sorted()
+                turn.endedAt = after.capturedAt
+            } catch { turn.reviewFailure = "Could not capture all final changes: \(error.localizedDescription)" }
+            turn.status = finalStatus
+        }
+        currentTurn = nil
+        if let lease { AgentWorkspaceCoordinator.shared.release(lease) }
+        workspace.refresh()
+        isBusy = false; isStopping = false; canForceDisconnect = false; preparationStatus = ""
+    }
+
+    func stop() {
+        guard isBusy, !isStopping else { return }
+        isStopping = true
+        flushUpdates(); cancelPermissions()
+        if let sessionID { transport.notify("session/cancel", params: .object(["sessionId": .string(sessionID)])) }
+        // Cancel preparation immediately; a running prompt is allowed to return its tail.
+        if currentTurn == nil { operation?.cancel() }
+        stopTimer = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            guard let self, self.isBusy else { return }
+            self.canForceDisconnect = true
+        }
+    }
+
+    func disconnect() {
+        guard !isBusy || canForceDisconnect else { return }
+        Task { [weak self] in await self?.stopAndDisconnect() }
+    }
+
+    func stopAndDisconnect() async {
+        cancelPermissions()
+        if let sessionID { transport.notify("session/cancel", params: .object(["sessionId": .string(sessionID)])) }
+        operation?.cancel()
+        await transport.shutdown()
+        isConnected = false
+        await operation?.value
+    }
+
+    func newChat() {
+        guard !isBusy, !isConnecting else { return }
+        operation?.cancel(); transport.close(); isConnected = false
+        sessionID = nil; turns = []; configOptions = []; errorMessage = nil
+        workspace?.dismissFileReview()
+    }
+
+    func close() {
+        closed = true
+        cancelPermissions(); operation?.cancel(); flushTask?.cancel(); stopTimer?.cancel()
+        transport.close()
+    }
+
+    private func receive(_ method: String, params: ACPJSON) {
+        guard method == "session/update", params["sessionId"].string == sessionID else { return }
+        let update = params["update"]
+        if update["sessionUpdate"].string == "config_option_update" {
+            configOptions = AgentConfigOption.parse(update["configOptions"])
+        }
+        guard currentTurn != nil else { return } // Do not append session/load replay to a live turn.
+        pendingUpdates.append(update)
+        if pendingUpdates.count >= 128 { flushUpdates() }
+        else if flushTask == nil {
+            flushTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(40)) } catch { return }
+                self?.flushUpdates()
+            }
+        }
+    }
+
+    private func flushUpdates() {
+        flushTask?.cancel(); flushTask = nil
+        let updates = pendingUpdates; pendingUpdates.removeAll(keepingCapacity: true)
+        if let currentTurn { for update in updates { currentTurn.apply(update) } }
+    }
+
+    private func handleRequest(_ method: String, id: ACPJSON, params: ACPJSON) {
+        flushUpdates()
+        guard method == "session/request_permission", params["sessionId"].string == sessionID,
+              currentTurn != nil, !isStopping else {
+            if method == "session/request_permission" { transport.respond(id: id, result: .object(["outcome": .object(["outcome": .string("cancelled")])])) }
+            else { transport.reject(id: id, message: "This client did not advertise \(method).") }
+            return
+        }
+        guard permissions.count < 32, id.requestKey != nil else {
+            transport.respond(id: id, result: .object(["outcome": .object(["outcome": .string("cancelled")])]))
+            return
+        }
+        var tool = params["toolCall"].object ?? [:]
+        tool["sessionUpdate"] = .string("tool_call_update")
+        currentTurn?.apply(.object(tool))
+        let permission = AgentPermission(requestID: id,
+            title: tool["rawInput"]?["command"].string ?? tool["title"]?.string ?? "Codex requests permission",
+            cwd: tool["rawInput"]?["cwd"].string ?? workspace?.rootURL.path ?? "",
+            options: params["options"].array.compactMap { option in
+                guard let id = option["optionId"].string, let kind = option["kind"].string,
+                      ["allow_once", "allow_always", "reject_once", "reject_always"].contains(kind) else { return nil }
+                return AgentPermission.Option(id: id, name: option["name"].string ?? id, kind: kind)
+            })
+        guard !permission.options.isEmpty else {
+            transport.respond(id: id, result: .object(["outcome": .object(["outcome": .string("cancelled")])]))
+            return
+        }
+        if !permissions.contains(where: { $0.id == permission.id }) { permissions.append(permission) }
+    }
+
+    func answer(_ permission: AgentPermission, option: AgentPermission.Option) {
+        guard permissions.contains(where: { $0.id == permission.id }), permission.options.contains(where: { $0.id == option.id }) else { return }
+        permissions.removeAll { $0.id == permission.id }
+        transport.respond(id: permission.requestID, result: .object([
+            "outcome": .object(["outcome": .string("selected"), "optionId": .string(option.id)])
+        ]))
+    }
+
+    private func cancelPermissions() {
+        let outstanding = permissions; permissions = []
+        for permission in outstanding {
+            transport.respond(id: permission.requestID, result: .object(["outcome": .object(["outcome": .string("cancelled")])]))
+        }
+    }
+}

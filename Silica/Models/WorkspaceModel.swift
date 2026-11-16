@@ -41,6 +41,12 @@ final class WorkspaceModel {
     }
     private(set) var buffers: [URL: EditorBuffer] = [:]
     private(set) var fileReview: FileReviewModel?
+    var isAgentPanelVisible = false
+    @ObservationIgnored lazy var agent = AgentSessionModel(workspace: self)
+    @ObservationIgnored private var sidebarHiddenForAgent = false
+
+    var isAgentEditingLocked: Bool { AgentWorkspaceCoordinator.shared.isLocked(rootURL) }
+    var needsCloseConfirmation: Bool { hasUnsavedChanges || agent.isBusy || agent.isConnecting }
 
     /// The project's window, to bring forward when a file is opened in it from outside.
     @ObservationIgnored weak var window: NSWindow?
@@ -86,9 +92,12 @@ final class WorkspaceModel {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveSession() }
         }
+        AgentWorkspaceCoordinator.shared.register(self)
     }
 
     func close() {
+        agent.close()
+        AgentWorkspaceCoordinator.shared.unregister(self)
         fileReview?.cancel()
         saveSession()
         if let terminationObserver {
@@ -127,7 +136,41 @@ final class WorkspaceModel {
     }
 
     func toggleSidebar() {
+        sidebarHiddenForAgent = false
         withAnimation(.snappy) { isSidebarVisible.toggle() }
+    }
+
+    func toggleAgentPanel() {
+        if isAgentPanelVisible {
+            isAgentPanelVisible = false
+            if sidebarHiddenForAgent { isSidebarVisible = true; sidebarHiddenForAgent = false }
+        } else {
+            if isSidebarVisible, (window?.contentView?.bounds.width ?? 1180) < 1040 {
+                isSidebarVisible = false; sidebarHiddenForAgent = true
+            }
+            isAgentPanelVisible = true
+        }
+    }
+
+    func applyAgentEditProtection() {
+        for buffer in buffers.values { buffer.textController?.textView.isEditable = !isAgentEditingLocked }
+    }
+
+    func saveBeforeAgentTurn() -> Bool {
+        let dirty = buffers.values.filter { $0.isDirty && !$0.isUntitled }
+        guard !dirty.isEmpty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Save changes before Codex starts?"
+        alert.informativeText = "Codex reads and writes files on disk. Save the edited files in this project window before capturing the task baseline."
+        alert.addButton(withTitle: "Save and Continue")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        return dirty.allSatisfy { save($0) }
+    }
+
+    private func canModifyProject() -> Bool {
+        if isAgentEditingLocked { NSSound.beep(); return false }
+        return true
     }
 
     // MARK: Sidebar modes
@@ -349,6 +392,7 @@ final class WorkspaceModel {
 
     private func makeBuffer(for url: URL) -> EditorBuffer {
         let buffer = EditorBuffer(url: url)
+        buffer.textController?.textView.isEditable = !isAgentEditingLocked
         // Links in a Markdown preview open other project files here, like Quick Open.
         buffer.openFile = { [weak self] target in
             self?.open(target)
@@ -381,6 +425,7 @@ final class WorkspaceModel {
 
     /// New File (⌘N): an empty "Untitled-N" tab, saved somewhere only when asked.
     func newUntitledFile() {
+        guard canModifyProject() else { return }
         let taken = Set(openTabs.filter(\.isUntitled).map(\.lastPathComponent))
         var number = 1
         while taken.contains("Untitled-\(number)") { number += 1 }
@@ -456,11 +501,29 @@ final class WorkspaceModel {
     }
 
     func resetFileReviewBaseline() {
+        guard canModifyProject() else { return }
         guard activeBuffer?.captureReviewBaseline() == true else {
             showAlert("Can’t Capture Baseline", info: DiffError.inputTooLarge.localizedDescription)
             return
         }
         if fileReview != nil { reviewActiveFile() }
+    }
+
+    func reviewAgentChange(_ change: TurnFileChange, turn: AgentTurn) {
+        guard let original = change.originalText, let updated = change.updatedText,
+              let url = AgentPaths.safeURL(change.path, root: rootURL) else { return }
+        fileReview?.cancel()
+        fileReview = FileReviewModel(url: url,
+            baseline: FileReviewBaseline(text: original, capturedAt: turn.baselineCapturedAt ?? turn.startedAt), updated: updated,
+            title: "Turn \(turn.number) Changes", isFrozen: true, notice: change.note, comparedAt: turn.endedAt ?? .now)
+    }
+
+    func openReviewedFile() {
+        guard let review = fileReview else { return }
+        let url = review.url
+        dismissFileReview()
+        open(url)
+        reveal(url)
     }
 
     enum TreeEdit: Equatable {
@@ -471,6 +534,7 @@ final class WorkspaceModel {
     /// Starts naming a new file or folder in the tree: inside the selected folder,
     /// next to the selected file, or at the top of the project.
     func beginNewItem(isDirectory: Bool, in folder: URL? = nil) {
+        guard canModifyProject() else { return }
         let target = folder ?? selection.map { $0.hasDirectoryPath ? $0 : $0.deletingLastPathComponent() } ?? rootURL
         let node = node(for: target) ?? root
         if !node.isExpanded { node.isExpanded = true }
@@ -479,6 +543,7 @@ final class WorkspaceModel {
     }
 
     func beginRename(_ url: URL) {
+        guard canModifyProject() else { return }
         showExplorer()
         treeEdit = .rename(url)
     }
@@ -490,6 +555,7 @@ final class WorkspaceModel {
     /// Creates the file or folder named in the tree. A name with slashes creates the
     /// folders in between, as in VS Code.
     func createItem(named rawName: String, in folder: URL, isDirectory: Bool) {
+        guard canModifyProject() else { return }
         treeEdit = nil
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
@@ -518,6 +584,7 @@ final class WorkspaceModel {
     /// Renames in place; open tabs for the item (or anything inside a renamed folder)
     /// follow it, keeping their edits.
     func rename(_ url: URL, to rawName: String) {
+        guard canModifyProject() else { return }
         treeEdit = nil
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name != url.lastPathComponent else { return }
@@ -546,6 +613,7 @@ final class WorkspaceModel {
 
     /// Copies the item next to itself as "name copy", like Finder.
     func duplicate(_ url: URL) {
+        guard canModifyProject() else { return }
         let isDirectory = url.hasDirectoryPath
         let folder = url.deletingLastPathComponent()
         let ext = isDirectory ? "" : url.pathExtension
@@ -571,6 +639,7 @@ final class WorkspaceModel {
     /// Moves the item to the Trash. Unedited tabs for it close; edited ones stay
     /// open, marked as deleted, so nothing typed is lost.
     func moveToTrash(_ url: URL) {
+        guard canModifyProject() else { return }
         do {
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
@@ -587,6 +656,7 @@ final class WorkspaceModel {
     /// Save As (⇧⌘S): writes the text to a new file, which takes the tab's place. The
     /// original file keeps what was last saved.
     func saveActiveAs() {
+        guard canModifyProject() else { return }
         guard let buffer = activeBuffer, buffer.textController != nil,
               let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
         let panel = savePanel(for: buffer)
@@ -610,6 +680,7 @@ final class WorkspaceModel {
     /// the file was written.
     @discardableResult
     func save(_ buffer: EditorBuffer, as url: URL) -> Bool {
+        guard canModifyProject() else { return false }
         let destination = Self.normalized(url, isDirectory: false)
         let source = buffer.url
         guard destination != source else {
@@ -770,6 +841,7 @@ final class WorkspaceModel {
 
     @discardableResult
     private func save(_ buffer: EditorBuffer) -> Bool {
+        guard canModifyProject() else { return false }
         // Untitled: ask where, in a panel of its own (this runs inside other prompts).
         if buffer.isUntitled {
             let panel = savePanel(for: buffer)
@@ -835,6 +907,21 @@ final class WorkspaceModel {
     /// closes or the app quits. `completion(true)` means go ahead: everything was
     /// saved, or the user chose not to save.
     func confirmClosing(in window: NSWindow, completion: @escaping (Bool) -> Void) {
+        if agent.isBusy || agent.isConnecting {
+            let alert = NSAlert()
+            alert.messageText = "Codex is still working in this window."
+            alert.informativeText = "Stopping closes this connection. Files already changed remain on disk and the final changes are captured before closing."
+            alert.addButton(withTitle: "Keep Open")
+            alert.addButton(withTitle: "Stop and Close")
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard let self, response == .alertSecondButtonReturn else { completion(false); return }
+                Task {
+                    await self.agent.stopAndDisconnect()
+                    self.confirmClosing(in: window, completion: completion)
+                }
+            }
+            return
+        }
         let unsaved = unsavedBuffers
         guard !unsaved.isEmpty else {
             completion(true)

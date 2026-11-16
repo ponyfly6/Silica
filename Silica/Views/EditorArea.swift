@@ -13,6 +13,10 @@ struct EditorArea: View {
                 }
                 EditorTabBar(workspace: workspace)
                 Spacer(minLength: 0)
+                Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sparkles") }
+                    .buttonStyle(.borderless)
+                    .help("Show or Hide Codex (⇧⌘A)").accessibilityLabel("Toggle Codex panel")
+                    .padding(.trailing, 4)
                 if workspace.activeBuffer?.textController != nil {
                     Button { workspace.reviewActiveFile() } label: {
                         Image(systemName: "arrow.left.arrow.right")
@@ -30,6 +34,13 @@ struct EditorArea: View {
             .frame(height: WorkspaceLayout.titleBarHeight)
 
             editorCard
+                .overlay(alignment: .bottomLeading) {
+                    if workspace.isAgentEditingLocked {
+                        Text("Codex is working · editing protected")
+                            .font(.caption).padding(8).background(.regularMaterial, in: .rect(cornerRadius: 8))
+                            .padding(8)
+                    }
+                }
                 .padding(.leading, workspace.isSidebarVisible ? 0 : WorkspaceLayout.cardInset)
                 .padding([.trailing, .bottom], WorkspaceLayout.cardInset)
         }

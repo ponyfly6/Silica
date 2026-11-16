@@ -106,6 +106,11 @@ struct AppCommands: Commands {
         }
 
         CommandGroup(replacing: .sidebar) {
+            Button(workspace?.isAgentPanelVisible == true ? "Hide Codex" : "Show Codex") { workspace?.toggleAgentPanel() }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(workspace == nil)
+
+            Divider()
             Button(workspace?.isSidebarVisible == false ? "Show Sidebar" : "Hide Sidebar") {
                 workspace?.toggleSidebar()
             }

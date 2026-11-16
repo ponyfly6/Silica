@@ -1,0 +1,9 @@
+{
+  "name": "silica-workbench-codex-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned ACP adapter for Silica Workbench development",
+  "dependencies": {
+    "@agentclientprotocol/codex-acp": "2.6.0"
+  }
+}

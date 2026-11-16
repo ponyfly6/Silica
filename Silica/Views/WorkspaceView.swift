@@ -97,6 +97,7 @@ struct WorkspaceView: View {
                     .transition(.move(edge: .leading).combined(with: .opacity))
             }
             EditorArea(workspace: workspace)
+            if workspace.isAgentPanelVisible { AgentPanelView(model: workspace.agent, workspace: workspace) }
         }
         .ignoresSafeArea(.container, edges: .top)
         .overlay {
@@ -104,7 +105,9 @@ struct WorkspaceView: View {
                 QuickOpenOverlay(workspace: workspace)
             }
         }
-        .frame(minWidth: 640, minHeight: 400)
+        .frame(minWidth: workspace.isAgentPanelVisible
+               ? 780 + (workspace.isSidebarVisible ? min(max(sidebarWidth, 220), 480) : 0) : 640,
+               minHeight: workspace.isAgentPanelVisible ? 520 : 400)
         .containerBackground(for: .window) {
             VisualEffectView()
         }
