@@ -40,6 +40,7 @@ final class WorkspaceModel {
         didSet { scheduleSessionSave() }
     }
     private(set) var buffers: [URL: EditorBuffer] = [:]
+    private(set) var fileReview: FileReviewModel?
 
     /// The project's window, to bring forward when a file is opened in it from outside.
     @ObservationIgnored weak var window: NSWindow?
@@ -88,6 +89,7 @@ final class WorkspaceModel {
     }
 
     func close() {
+        fileReview?.cancel()
         saveSession()
         if let terminationObserver {
             NotificationCenter.default.removeObserver(terminationObserver)
@@ -356,6 +358,7 @@ final class WorkspaceModel {
     }
 
     func activate(_ url: URL) {
+        if activeTab != url { dismissFileReview() }
         activeTab = url
         // An untitled file has no row in the tree or place in Quick Open.
         if url.isUntitled {
@@ -419,6 +422,7 @@ final class WorkspaceModel {
         }
 
         openTabs.remove(at: index)
+        if fileReview?.url == url { dismissFileReview() }
         buffers[url] = nil
 
         if activeTab == url {
@@ -432,6 +436,32 @@ final class WorkspaceModel {
     }
 
     // MARK: File operations
+
+    func reviewActiveFile() {
+        guard let buffer = activeBuffer, let controller = buffer.textController else { return }
+        guard let baseline = buffer.reviewBaseline else {
+            showAlert("Can’t Compare File", info: DiffError.inputTooLarge.localizedDescription)
+            return
+        }
+        fileReview?.cancel()
+        fileReview = FileReviewModel(url: buffer.url, baseline: baseline, updated: controller.textView.string)
+    }
+
+    func dismissFileReview() {
+        fileReview?.cancel()
+        fileReview = nil
+        if let textView = activeBuffer?.textController?.textView {
+            DispatchQueue.main.async { textView.window?.makeFirstResponder(textView) }
+        }
+    }
+
+    func resetFileReviewBaseline() {
+        guard activeBuffer?.captureReviewBaseline() == true else {
+            showAlert("Can’t Capture Baseline", info: DiffError.inputTooLarge.localizedDescription)
+            return
+        }
+        if fileReview != nil { reviewActiveFile() }
+    }
 
     enum TreeEdit: Equatable {
         case rename(URL)
@@ -611,6 +641,7 @@ final class WorkspaceModel {
 
     /// Points tabs at their new location after a rename.
     private func retargetBuffers(from old: URL, to new: URL) {
+        dismissFileReview()
         let oldPath = old.path(percentEncoded: false).trimmingTrailingSlash
         let newPath = new.path(percentEncoded: false).trimmingTrailingSlash
         func moved(_ url: URL) -> URL? {

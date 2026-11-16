@@ -13,7 +13,16 @@ struct EditorArea: View {
                 }
                 EditorTabBar(workspace: workspace)
                 Spacer(minLength: 0)
-                if let buffer = workspace.activeBuffer, buffer.isMarkdown {
+                if workspace.activeBuffer?.textController != nil {
+                    Button { workspace.reviewActiveFile() } label: {
+                        Image(systemName: "arrow.left.arrow.right")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Review File Changes (⇧⌘D)")
+                    .accessibilityLabel("Review file changes")
+                    .padding(.trailing, 8)
+                }
+                if let buffer = workspace.activeBuffer, buffer.isMarkdown, workspace.fileReview == nil {
                     MarkdownModeToggle(buffer: buffer)
                         .padding(.trailing, WorkspaceLayout.cardInset + 4)
                 }
@@ -32,7 +41,9 @@ struct EditorArea: View {
         // the others (under the tab bar) fall back to the minimum.
         let shape = ConcentricRectangle(corners: .concentric(minimum: .fixed(WorkspaceLayout.cardCornerRadius)))
         return Group {
-            if let buffer = workspace.activeBuffer {
+            if let review = workspace.fileReview {
+                FileReviewView(model: review, workspace: workspace)
+            } else if let buffer = workspace.activeBuffer {
                 BufferView(buffer: buffer, workspace: workspace)
             } else {
                 EmptyEditorView(workspace: workspace)

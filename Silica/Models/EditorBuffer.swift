@@ -22,6 +22,8 @@ final class EditorBuffer: Identifiable {
     /// A new file (⌘N) that hasn't been saved anywhere yet; `url` is a placeholder.
     let isUntitled: Bool
     private(set) var encoding: String.Encoding
+    /// Independent of saves and disk synchronization; comparisons keep their original version.
+    private(set) var reviewBaseline: FileReviewBaseline?
 
     var isDirty = false
     /// The file was deleted or moved away after it was opened. The tab keeps its
@@ -78,6 +80,7 @@ final class EditorBuffer: Identifiable {
         content = .text(controller)
         controller.buffer = self
         controller.updateStatus()
+        captureReviewBaseline()
     }
 
     /// Whether closing it should ask to save: edited files, and untitled ones with
@@ -138,6 +141,15 @@ final class EditorBuffer: Identifiable {
         content = .text(controller)
         controller.buffer = self
         controller.updateStatus()
+        captureReviewBaseline()
+    }
+
+    @discardableResult
+    func captureReviewBaseline() -> Bool {
+        guard let text = textController?.textView.string,
+              text.utf8.count <= GitDiffEngine.maximumInputBytes else { return false }
+        reviewBaseline = FileReviewBaseline(text: text, capturedAt: .now)
+        return true
     }
 
     // MARK: Status

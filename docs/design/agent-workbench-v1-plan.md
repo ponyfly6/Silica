@@ -1,12 +1,16 @@
 # Agent Workbench v1 implementation plan
 
-设计依据：[agent-workbench-v1.md](agent-workbench-v1.md)。本轮只完成 fork、分支和设计，以下全部是待实施任务。
+设计依据：[agent-workbench-v1.md](agent-workbench-v1.md)。
+
+2026-11-16 进度：已实现独立应用身份及更新源隔离、Git histogram 文本比较、原生 AppKit 文件审阅、打开时基线／手动重设、未保存内容比较和 25 项核心检查。当前入口为 ⇧⌘D，基线仅在标签页存活期间保留。Codex/ACP、项目级 TurnCheckpoint、变更文件列表与历史仍待实施，文件审阅不是完整 M2 的完成标志。
+
+本机 UI 验证已覆盖浅色／深色、快捷键入口、未保存修改、保存后保留基线、返回编辑器、重设基线后的 No Changes，以及以新基线继续比较。开发版使用独立 `build/Silica Workbench.app` 启动，避免复用此前仍运行的上游实例。
 
 ## M0：先证明运行链路
 
-- [ ] 隔离 fork 的 bundle ID、显示名、数据目录和 Sparkle 启动／菜单入口；保留版权和 license。
-- [ ] 将本地 `.derivedData/` 加入适当 ignore，避免提交构建产物。
-- [ ] 编译现有应用，记录 Xcode、macOS、scheme 与构建命令；不为了 ACP 提前改造编辑器。
+- [x] 隔离 fork 的 bundle ID、显示名、偏好数据目录和 Sparkle 启动／菜单入口；保留版权和 license。
+- [x] 将本地 `.derivedData/` 加入适当 ignore，避免提交构建产物。
+- [x] 编译应用：Xcode 27.2、macOS 27.2.1、Silica scheme，Debug + 本地 ad hoc 签名；执行 `xcodebuild -scheme Silica -project Silica.xcodeproj -configuration Debug -derivedDataPath .derivedData CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build`。
 - [ ] 显式安装候选 `codex-acp@2.6.0` 到开发工具目录，记录完整 lockfile、适配器和实际 Codex 版本。保留用户已有 Codex 配置。
 - [ ] 建最小 stdio 探针：initialize → session/new → 无写入 prompt → session/update；不在日志中导出认证或用户代码。
 - [ ] 在独立 fixture 项目验证：受控文件修改、shell 输出和 exit code、拒绝权限、session/cancel、session/load、断连后的部分事件。

@@ -187,6 +187,15 @@ struct AppCommands: Commands {
         CommandMenu("Editor") {
             let hasText = workspace?.activeBuffer?.textController != nil
 
+            Button("Review File Changes") { workspace?.reviewActiveFile() }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(!hasText)
+
+            Button("Set File Review Baseline") { workspace?.resetFileReviewBaseline() }
+                .disabled(!hasText)
+
+            Divider()
+
             Button("Go to Line…") { workspace?.showGoToLine() }
                 .keyboardShortcut("l")
                 .disabled(!hasText)

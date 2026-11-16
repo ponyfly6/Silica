@@ -1,4 +1,39 @@
-# Silica
+# Silica Workbench
+
+This development fork of [dqhieu/Silica](https://github.com/dqhieu/Silica) is building
+a native agent workbench. It uses a separate app identity and does not check the
+upstream Sparkle feed. Codex/ACP integration is planned; it is not connected yet.
+
+## Native file review
+
+Open a text file, edit it, then press **⇧⌘D** or click the comparison button in the
+tab bar. File Review shows a read-only, selectable AppKit diff with old/new line
+numbers, additions/deletions, and three lines of context. **Open File** returns to
+the editor; **Refresh** compares the latest editor contents, including unsaved edits.
+
+The baseline is captured when a file is opened. Saving or external disk refreshes
+do not replace it. **Reset Baseline** (also Editor › Set File Review Baseline) uses
+the current editor version instead. Baselines live for the open tab only; these
+are file comparisons, not yet per-agent-turn project checkpoints.
+
+Comparison uses an installed Git executable with `diff --no-index`, even outside a
+Git repository. Each text version is limited to 1 MiB, the displayed patch to
+20,000 rows / 8 MiB, and computation to five seconds. Oversized or failed comparisons
+show an error rather than a partial diff. No files are reverted or staged.
+
+Build with the existing Silica scheme. Core diff checks run with:
+
+```sh
+bash scripts/test-review.sh
+```
+
+Design and implementation milestones are in [docs/design](docs/design/agent-workbench-v1.md).
+The description below documents the upstream editor foundation. Upstream downloads
+and releases do not include this fork's workbench features.
+
+---
+
+## Upstream Silica
 
 A lightweight code editor for macOS, made of glass. Open a folder, find files fast,
 and edit with syntax highlighting, a minimap and a Markdown preview, all in a native
