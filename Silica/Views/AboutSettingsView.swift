@@ -131,7 +131,7 @@ enum AppInfo {
         Bundle.main.object(forInfoDictionaryKey: key) as? String
     }
 
-    static var name: String { value("CFBundleName") ?? "Silica" }
+    static var name: String { value("CFBundleDisplayName") ?? value("CFBundleName") ?? "Silica" }
     static var version: String { value("CFBundleShortVersionString") ?? "—" }
     static var build: String { value("CFBundleVersion") ?? "—" }
     static var copyright: String? { value("NSHumanReadableCopyright") }

@@ -13,6 +13,7 @@ xcuserdata/
 # Build output
 build/
 DerivedData/
+.derivedData/
 *.moved-aside
 *.hmap
 *.ipa

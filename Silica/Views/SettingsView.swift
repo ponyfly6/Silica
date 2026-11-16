@@ -188,9 +188,14 @@ private struct GeneralSettingsPane: View {
 
             SettingsGroup("Updates") {
                 SettingsToggle("Check for updates automatically", isOn: $updater.automaticallyChecksForUpdates)
+                    .disabled(!updater.isConfigured)
                 SettingsRow("Version \(AppInfo.version) (\(AppInfo.build))") {
                     Button("Check Now") { updater.checkForUpdates() }
                         .disabled(!updater.canCheckForUpdates)
+                }
+            } footer: {
+                if !updater.isConfigured {
+                    Text("Automatic and manual updates are disabled for this development fork.")
                 }
             }
         }
