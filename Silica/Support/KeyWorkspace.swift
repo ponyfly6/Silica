@@ -27,11 +27,24 @@ final class KeyWorkspace: ObservableObject {
                 workspace.quickOpen.query += characters
                 return nil
             }
-            guard flags == [.command, .shift], let workspace = self?.current,
+            guard let workspace = self?.current,
                   // Not while a sheet or alert is up.
                   event.window?.attachedSheet == nil, NSApp.modalWindow == nil,
                   let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
+            // Handle the chat shortcut even when its native text editor has focus.
+            if flags == [.command], key == "r" {
+                if !event.isARepeat { workspace.toggleAgentPanel() }
+                return nil
+            }
+            // Keep the original sidebar shortcut alongside the menu's ⌘B.
+            if flags == [.command, .control], key == "s" {
+                workspace.toggleSidebar()
+                return nil
+            }
+            guard flags == [.command, .shift] else { return event }
             switch key {
+            case "a":
+                workspace.toggleAgentPanel()
             case "v":
                 guard let buffer = workspace.activeBuffer, buffer.isMarkdown else { return event }
                 buffer.togglePreview()

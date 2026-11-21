@@ -18,6 +18,9 @@ final class AgentSessionModel {
     private(set) var permissions: [AgentPermission] = []
     private(set) var configOptions: [AgentConfigOption] = []
     private(set) var preparationStatus = ""
+    /// Owned processes that outlived cleanup. Only the user can release the project then.
+    private(set) var survivingProcessIDs: [Int32] = []
+    @ObservationIgnored private var releasedProcessIDs: [Int32] = []
     @ObservationIgnored private weak var workspace: WorkspaceModel?
     @ObservationIgnored private let transport = ACPTransport()
     @ObservationIgnored private var operation: Task<Void, Never>?
@@ -66,7 +69,9 @@ final class AgentSessionModel {
         }
         isConnecting = true; errorMessage = nil
         defer { isConnecting = false }
-        try transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath())
+        releasedProcessIDs = []
+        try await transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath())
+        survivingProcessIDs = []
         let initialized = try await transport.request("initialize", params: .object([
             "protocolVersion": .number(1),
             "clientInfo": .object(["name": .string("silica-workbench"), "title": .string("Silica Workbench"), "version": .string("0.1.0")]),
@@ -161,8 +166,12 @@ final class AgentSessionModel {
                 ])
             ]), timeout: nil)
             flushUpdates()
+            try Task.checkCancellation()
             // A prompt response is not evidence that a background command exited.
             while response["stopReason"].string != "cancelled", turn.hasUnfinishedCommands {
+                // The prompt RPC already returned; there is no pending response
+                // for session/cancel to finish. Stop must leave this wait too.
+                if isStopping { throw CancellationError() }
                 turn.status = "Waiting for command exit"
                 try await Task.sleep(for: .milliseconds(100))
                 flushUpdates()
@@ -173,7 +182,9 @@ final class AgentSessionModel {
             default: turn.status = "Stopped: \(response["stopReason"].string ?? "unknown reason")"
             }
         } catch is CancellationError {
-            turn.status = "Cancelled"; failed = true
+            if turn.eventLimitExceeded { turn.status = "Failed" }
+            else { turn.status = isStopping || transport.isConnected ? "Cancelled" : "Interrupted" }
+            cancelled = turn.status == "Cancelled"; failed = true
         } catch {
             flushUpdates()
             turn.status = "Failed"; failed = true
@@ -182,9 +193,13 @@ final class AgentSessionModel {
         stopTimer?.cancel(); stopTimer = nil
         flushUpdates(); cancelPermissions()
         if failed || cancelled || isStopping {
-            await transport.shutdown()
+            let finalStatus = turn.status
+            turn.status = "Stopping processes…"
+            await shutdownProcesses()
             isConnected = false
+            turn.status = finalStatus
         }
+        turn.finishTools(cancelled || isStopping ? "cancelled" : "interrupted")
         if let baseline {
             if !turns.contains(where: { $0.id == turn.id }) { turns.append(turn) }
             let finalStatus = turn.status
@@ -200,6 +215,10 @@ final class AgentSessionModel {
                 turn.warnings = Array(Set(turn.warnings + after.warnings)).sorted()
                 turn.endedAt = after.capturedAt
             } catch { turn.reviewFailure = "Could not capture all final changes: \(error.localizedDescription)" }
+            if !releasedProcessIDs.isEmpty {
+                let note = "Released while Codex processes \(Self.list(releasedProcessIDs)) were still running. They may change files after this capture; treat this review as provisional."
+                turn.reviewFailure = [turn.reviewFailure, note].compactMap { $0 }.joined(separator: "\n")
+            }
             turn.status = finalStatus
         }
         currentTurn = nil
@@ -227,14 +246,51 @@ final class AgentSessionModel {
         Task { [weak self] in await self?.stopAndDisconnect() }
     }
 
+    /// One cleanup attempt. If owned processes survive it, the running turn keeps
+    /// the project protected until they exit or the user releases them.
     func stopAndDisconnect() async {
         cancelPermissions()
         if let sessionID { transport.notify("session/cancel", params: .object(["sessionId": .string(sessionID)])) }
         operation?.cancel()
-        await transport.shutdown()
+        let result = await transport.shutdown()
         isConnected = false
+        guard releasedProcessIDs.isEmpty else { return }
+        guard result.isComplete else { noteSurvivors(result); return }
+        survivingProcessIDs = []
         await operation?.value
     }
+
+    /// The user accepts that the surviving processes are outside Silica's control:
+    /// the turn finishes with a provisional review and releases its lease.
+    func releaseSurvivingProcesses() async {
+        guard !survivingProcessIDs.isEmpty else { return }
+        releasedProcessIDs = survivingProcessIDs; survivingProcessIDs = []
+        transport.abandonProcesses()
+        isConnected = false
+        errorMessage = "Released the project while Codex processes \(Self.list(releasedProcessIDs)) were still running."
+        await operation?.value
+    }
+
+    private func shutdownProcesses() async {
+        while true {
+            let result = await transport.shutdown()
+            guard releasedProcessIDs.isEmpty else { return }
+            if result.isComplete { survivingProcessIDs = []; return }
+            // Do not capture a final version or release a lease while a known
+            // owned writer is still alive. Retry cleanup without blocking AppKit.
+            noteSurvivors(result)
+            await Task.detached { try? await Task.sleep(for: .seconds(1)) }.value
+        }
+    }
+
+    private func noteSurvivors(_ result: AgentShutdownResult) {
+        survivingProcessIDs = result.remainingProcessIDs
+        errorMessage = "Codex processes \(Self.list(survivingProcessIDs)) did not stop. "
+            + (isBusy ? "Project editing stays protected while Silica keeps trying." : "Reconnect after they exit.")
+        if isBusy { canForceDisconnect = true }
+    }
+
+    private static func list(_ ids: [Int32]) -> String { ids.map(String.init).joined(separator: ", ") }
 
     func newChat() {
         guard !isBusy, !isConnecting else { return }
@@ -269,7 +325,16 @@ final class AgentSessionModel {
     private func flushUpdates() {
         flushTask?.cancel(); flushTask = nil
         let updates = pendingUpdates; pendingUpdates.removeAll(keepingCapacity: true)
-        if let currentTurn { for update in updates { currentTurn.apply(update) } }
+        if let currentTurn {
+            for update in updates {
+                if !currentTurn.apply(update) { stopForEventLimit() }
+            }
+        }
+    }
+
+    private func stopForEventLimit() {
+        errorMessage = "Codex exceeded the tool-state limit. This turn is stopping; partial output and changes are preserved."
+        operation?.cancel()
     }
 
     private func handleRequest(_ method: String, id: ACPJSON, params: ACPJSON) {
@@ -286,7 +351,11 @@ final class AgentSessionModel {
         }
         var tool = params["toolCall"].object ?? [:]
         tool["sessionUpdate"] = .string("tool_call_update")
-        currentTurn?.apply(.object(tool))
+        if currentTurn?.apply(.object(tool)) == false {
+            stopForEventLimit()
+            transport.respond(id: id, result: .object(["outcome": .object(["outcome": .string("cancelled")])]))
+            return
+        }
         let permission = AgentPermission(requestID: id,
             title: tool["rawInput"]?["command"].string ?? tool["title"]?.string ?? "Codex requests permission",
             cwd: tool["rawInput"]?["cwd"].string ?? workspace?.rootURL.path ?? "",

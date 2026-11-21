@@ -15,7 +15,7 @@ struct EditorArea: View {
                 Spacer(minLength: 0)
                 Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sparkles") }
                     .buttonStyle(.borderless)
-                    .help("Show or Hide Codex (⇧⌘A)").accessibilityLabel("Toggle Codex panel")
+                    .help("Show or Hide Codex (⌘R)").accessibilityLabel("Toggle Codex panel")
                     .padding(.trailing, 4)
                 if workspace.activeBuffer?.textController != nil {
                     Button { workspace.reviewActiveFile() } label: {
@@ -35,7 +35,7 @@ struct EditorArea: View {
 
             editorCard
                 .overlay(alignment: .bottomLeading) {
-                    if workspace.isAgentEditingLocked {
+                    if workspace.isAgentEditingLocked || workspace.activeBuffer.map({ workspace.isEditingLocked($0.url) }) == true {
                         Text("Codex is working · editing protected")
                             .font(.caption).padding(8).background(.regularMaterial, in: .rect(cornerRadius: 8))
                             .padding(8)

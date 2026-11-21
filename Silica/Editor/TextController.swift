@@ -378,6 +378,12 @@ final class TextController: NSObject, NSTextViewDelegate {
 
     private var isReplacingText = false
 
+    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        // Recheck the target at edit time too: a symlink may have been retargeted
+        // since the last refresh. Disk synchronization remains allowed.
+        isReplacingText || buffer.map { !AgentWorkspaceCoordinator.shared.isLocked($0.url) } != false
+    }
+
     /// Swaps in new text (the file as changed on disk) as one undoable edit that
     /// leaves the buffer clean. Only the differing middle is replaced, so the
     /// selection and scroll position stay put when the change is elsewhere.

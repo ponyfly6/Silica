@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 @main
 struct AgentCoreTests {
@@ -34,6 +35,13 @@ struct AgentCoreTests {
         check(turn.items[0].output == "first\nsecond\n", "Terminal deltas were lost or repeated")
         check(turn.items[0].title == "echo fixture" && turn.items[0].cwd == "/fixture", "Omitted fields did not preserve old state")
         check(turn.items[0].exitCode == 3 && !turn.hasUnfinishedCommands, "Exit status was not independent of tool completion")
+        let failedCommand = AgentTurn(number: 1, prompt: "failed command")
+        failedCommand.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("failed"), "status": .string("failed"),
+            "_meta": .object(["terminal_info": .object([:])])]))
+        check(failedCommand.hasUnfinishedCommands, "Tool failure is not evidence that its process exited")
+        failedCommand.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("failed"),
+            "_meta": .object(["terminal_exit": .object(["signal": .string("SIGTERM")])])]))
+        check(!failedCommand.hasUnfinishedCommands && failedCommand.items[0].exitCode == nil, "A signal exit must settle the terminal without inventing an exit code")
         for chunk in ["legacy one\n", "legacy two\n"] {
             turn.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("legacy"),
                 "_meta": .object(["terminal_output": .object(["data": .string(chunk)])])]))
@@ -43,6 +51,52 @@ struct AgentCoreTests {
         turn.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("read"), "status": .string("completed"),
             "_meta": .object(["terminal_output_delta": .object(["data": .string("file contents")])])]))
         check(!turn.hasUnfinishedCommands && turn.items.last?.output == "file contents", "Read tool output incorrectly requires terminal_exit")
+
+        let overflow = AgentTurn(number: 1, prompt: "large timeline")
+        for index in 0..<501 {
+            overflow.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("tool-\(index)"), "status": .string("completed")]))
+        }
+        overflow.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("tool-500"),
+            "_meta": .object(["terminal_info": .object(["terminal_id": .string("terminal")])])]))
+        check(overflow.items.count == 500 && overflow.omittedToolCount == 1 && overflow.timelineNotice != nil, "Timeline overflow must be visible and bounded")
+        check(overflow.hasUnfinishedCommands, "An undisplayed terminal must still hold completion open, even without cwd")
+        overflow.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("tool-500"),
+            "_meta": .object(["terminal_exit": .object(["exit_code": .number(7)])])]))
+        check(!overflow.hasUnfinishedCommands && overflow.timelineNotice?.contains("1 failed") == true, "An undisplayed command lost its exit/failure state")
+        overflow.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("tool-0"), "status": .string("failed")]))
+        check(overflow.items[0].status == "failed", "Presentation overflow stopped updates to retained tools")
+
+        let interrupted = AgentTurn(number: 1, prompt: "cancel")
+        interrupted.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("command"), "status": .string("completed"),
+            "_meta": .object(["terminal_info": .object(["cwd": .string("/fixture")])])]))
+        interrupted.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("read"), "status": .string("in_progress")]))
+        interrupted.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("done"), "status": .string("completed")]))
+        interrupted.finishTools("cancelled")
+        check(!interrupted.hasUnfinishedCommands && interrupted.items[0].displayStatus == "cancelled" && interrupted.items[0].exitCode == nil, "Cancellation must settle commands without inventing exit codes")
+        check(interrupted.items[1].displayStatus == "cancelled" && interrupted.items[2].displayStatus == "completed", "Cancellation changed a completed read or left an active tool running")
+        interrupted.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("command"), "status": .string("in_progress")]))
+        check(interrupted.items[0].displayStatus == "cancelled" && !interrupted.hasUnfinishedCommands, "A late reported status revived a locally cancelled command")
+        overflow.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("hidden-running"), "status": .string("in_progress"),
+            "_meta": .object(["terminal_info": .object([:])])]))
+        overflow.finishTools("interrupted")
+        check(!overflow.hasUnfinishedCommands && overflow.timelineNotice?.contains("1 cancelled or interrupted") == true, "Disconnect failed to settle hidden tools")
+
+        let truncated = AgentTurn(number: 1, prompt: "bounded text")
+        let largeText = String(repeating: "🐱", count: 70_000)
+        truncated.apply(.object(["sessionUpdate": .string("agent_message_chunk"), "content": .object(["text": .string(largeText)])]))
+        truncated.apply(.object(["sessionUpdate": .string("agent_message_chunk"), "content": .object(["text": .string("tail")])]))
+        check(truncated.items[0].text.utf8.count <= 262_144 && truncated.items[0].textTruncated && !truncated.items[0].text.contains("�"), "Assistant truncation must be explicit and UTF-8 bounded")
+        truncated.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("output"),
+            "_meta": .object(["terminal_output_delta": .object(["data": .string(String(repeating: "é", count: 600_000))])])]))
+        check(truncated.items[1].output.utf8.count <= 1_048_576 && truncated.items[1].outputTruncated, "Tool output exceeded its byte cap")
+        truncated.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("output"),
+            "content": .array([.object(["content": .object(["text": .string(String(repeating: "x", count: 1_048_577))])])])]))
+        check(truncated.items[1].contentText.utf8.count == 1_048_576 && truncated.items[1].outputTruncated, "Structured output truncation was silent")
+        var accepted = true
+        for index in 1..<20_000 {
+            accepted = overflow.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("more-\(index)")]))
+        }
+        check(!accepted && overflow.eventLimitExceeded, "Exhausting lifecycle storage must request a stop, not silently drop tools")
 
         let fixture = URL(filePath: CommandLine.arguments[1])
         let root = FileManager.default.temporaryDirectory.appending(path: "silica-agent-tests-\(UUID().uuidString)")
@@ -91,7 +145,7 @@ struct AgentCoreTests {
         var sequence: [Int] = []
         transport.onNotification = { _, params in if let value = params["sequence"].integer { sequence.append(value) } }
         transport.onRequest = { _, id, _ in transport.respond(id: id, result: .object(["outcome": .string("fixture-selected")])) }
-        try transport.start(executable: fixture, cwd: root)
+        try await transport.start(executable: fixture, cwd: root)
         let echo = try await transport.request("echo", params: .object(["text": .string("roundtrip 🐱")]))
         check(echo["text"].string == "roundtrip 🐱", "RPC response was not matched to its request")
         _ = try await transport.request("notify", params: .object([:]))
@@ -106,6 +160,38 @@ struct AgentCoreTests {
         catch { count += 1 }
         await transport.shutdown()
         check(!transport.isConnected, "Shutdown did not close the transport")
+
+        let processFixture = URL(filePath: CommandLine.arguments[2])
+        for method in ["spawn-writer", "orphan", "spawn-on-eof", "block-stdin"] {
+            let processTransport = ACPTransport()
+            let heartbeat = root.appending(path: "\(method).heartbeat")
+            try await processTransport.start(executable: processFixture, cwd: root)
+            let result = try await processTransport.request(method, params: .object(["path": .string(heartbeat.path)]))
+            var pid = result["pid"].integer.map { Int32($0) }
+            defer { if let pid, isRunning(pid) { kill(pid, SIGKILL) } }
+            if method == "orphan" { try await Task.sleep(for: .milliseconds(500)) }
+            var blockedWrite: Task<Void, Never>?
+            if method == "block-stdin" {
+                blockedWrite = Task { _ = try? await processTransport.request("large-write", params: .object(["data": .string(String(repeating: "x", count: 1_048_576))])) }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let shutdown = await processTransport.shutdown()
+            await blockedWrite?.value
+            if method == "spawn-on-eof" {
+                pid = Int32(try String(contentsOf: URL(filePath: heartbeat.path + ".pid"), encoding: .utf8))
+            }
+            check(shutdown.isComplete && pid.map({ !isRunning($0) }) == true, "\(method): shutdown left an owned process alive")
+            let frozen = try Data(contentsOf: heartbeat)
+            try await Task.sleep(for: .milliseconds(150))
+            let later = try Data(contentsOf: heartbeat)
+            check(frozen == later, "\(method): a child continued writing after shutdown returned")
+        }
         print("PASS: \(count) ACP framing, ordered dispatch, RPC, tool events, cancellation boundaries and per-turn snapshot checks")
+    }
+
+    nonisolated static func isRunning(_ pid: Int32) -> Bool {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size && info.pbi_status != SZOMB
     }
 }

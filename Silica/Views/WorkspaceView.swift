@@ -152,6 +152,6 @@ struct SidebarToggleButton: View {
         // Same plain icon style as the Refresh and Collapse buttons in the sidebar header.
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(workspace.isSidebarVisible ? "Hide Sidebar (⌃⌘S)" : "Show Sidebar (⌃⌘S)")
+        .help(workspace.isSidebarVisible ? "Hide Sidebar (⌘B)" : "Show Sidebar (⌘B)")
     }
 }

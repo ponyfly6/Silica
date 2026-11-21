@@ -42,7 +42,7 @@ struct ACPLiveSmoke {
         }
         let executable = URL(filePath: CommandLine.arguments[1])
         func initialize() async throws -> ACPJSON {
-            try transport.start(executable: executable, cwd: root)
+            try await transport.start(executable: executable, cwd: root)
             return try await transport.request("initialize", params: .object([
                 "protocolVersion": .number(1), "clientInfo": .object(["name": .string("silica-workbench-test"), "version": .string("0.1.0")]),
                 "clientCapabilities": .object(["terminal": .bool(false), "fs": .object(["readTextFile": .bool(false), "writeTextFile": .bool(false)]),

@@ -4,6 +4,8 @@ struct AgentPanelView: View {
     @Bindable var model: AgentSessionModel
     let workspace: WorkspaceModel
     @State private var showsConnection = false
+    @State private var confirmsRelease = false
+    @FocusState private var isComposerFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,7 +18,7 @@ struct AgentPanelView: View {
                     .help("New chat · clears this window’s in-memory conversation and review snapshots")
                     .accessibilityLabel("New Codex chat")
                 Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sidebar.right") }
-                    .help("Hide Codex").accessibilityLabel("Hide Codex panel")
+                    .help("Hide Codex (⌘R)").accessibilityLabel("Hide Codex panel")
             }
             .buttonStyle(.borderless).foregroundStyle(.secondary)
             .frame(height: WorkspaceLayout.titleBarHeight).padding(.horizontal, 12)
@@ -116,6 +118,13 @@ struct AgentPanelView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Message Codex").font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $model.draft)
+                .focused($isComposerFocused)
+                .task {
+                    // Let the native text view join the window before requesting focus.
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    isComposerFocused = true
+                }
                 .font(.body).scrollContentBackground(.hidden)
                 .frame(minHeight: 60, idealHeight: 80, maxHeight: 120)
                 .padding(5).background(.primary.opacity(0.04), in: .rect(cornerRadius: 8))
@@ -124,7 +133,9 @@ struct AgentPanelView: View {
                 Text(model.isBusy ? "Project editing is protected" : "Snapshots cover non-ignored project files")
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                 Spacer(minLength: 0)
-                if model.canForceDisconnect {
+                if !model.survivingProcessIDs.isEmpty {
+                    Button("Release Project…", role: .destructive) { confirmsRelease = true }.controlSize(.small)
+                } else if model.canForceDisconnect {
                     Button("End Connection", role: .destructive) { model.disconnect() }.controlSize(.small)
                 } else if model.isBusy {
                     Button("Stop") { model.stop() }.disabled(model.isStopping).controlSize(.small)
@@ -136,6 +147,12 @@ struct AgentPanelView: View {
             }
         }
         .padding(10)
+        .alert("Release the project while Codex processes are still running?", isPresented: $confirmsRelease) {
+            Button("Release Project", role: .destructive) { Task { await model.releaseSurvivingProcesses() } }
+            Button("Keep Waiting", role: .cancel) {}
+        } message: {
+            Text("Processes \(model.survivingProcessIDs.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files. Silica stops protecting the project and marks this turn’s review as provisional. Check them in Activity Monitor.")
+        }
     }
 
     @ViewBuilder private func permissionButtons(_ permission: AgentPermission) -> some View {
@@ -162,6 +179,9 @@ private struct AgentTurnView: View {
             Text(turn.prompt).textSelection(.enabled).font(.callout)
                 .padding(10).frame(maxWidth: .infinity, alignment: .leading)
                 .background(.primary.opacity(0.05), in: .rect(cornerRadius: 8))
+            if let notice = turn.timelineNotice {
+                Text(notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
             ForEach(turn.items) { item in
                 switch item.kind {
                 case .assistant:
@@ -178,8 +198,10 @@ private struct AgentTurnView: View {
                             workspace.open(target)
                             return .handled
                         })
+                    if item.textTruncated { Text("Message truncated at 256 KiB").font(.caption).foregroundStyle(.secondary) }
                 case .notice:
                     DisclosureGroup(item.title) { Text(item.text).font(.caption).textSelection(.enabled) }
+                    if item.textTruncated { Text("Details truncated at 256 KiB").font(.caption).foregroundStyle(.secondary) }
                 case .tool:
                     AgentToolView(item: item)
                 }
@@ -220,11 +242,11 @@ private struct AgentTurnView: View {
 
 private struct AgentToolView: View {
     let item: AgentTimelineItem
-    private var awaitingExit: Bool { item.hasTerminal && item.exitCode == nil && item.status != "failed" }
+    private var awaitingExit: Bool { item.isAwaitingExit }
     private var symbol: String {
         if awaitingExit { return "clock" }
-        if item.status == "failed" || (item.exitCode ?? 0) != 0 { return "xmark.circle" }
-        return item.status == "completed" ? "checkmark.circle" : "clock"
+        if ["failed", "cancelled", "interrupted"].contains(item.displayStatus) || (item.exitCode ?? 0) != 0 { return "xmark.circle" }
+        return item.displayStatus == "completed" ? "checkmark.circle" : "clock"
     }
     var body: some View {
         DisclosureGroup {
@@ -237,6 +259,7 @@ private struct AgentToolView: View {
                         .frame(maxHeight: 180)
                 }
                 if item.outputTruncated { Text("Output truncated at 1 MiB").foregroundStyle(.secondary) }
+                if item.textTruncated { Text("Command details truncated at 16 KiB").foregroundStyle(.secondary) }
             }
             .font(.system(.caption, design: .monospaced))
         } label: {
@@ -244,7 +267,7 @@ private struct AgentToolView: View {
                 Image(systemName: symbol)
                 Text(item.title.isEmpty ? "Tool call" : item.title).lineLimit(2).truncationMode(.middle)
                 Spacer(minLength: 0)
-                Text(item.exitCode.map { "exit \($0)" } ?? (awaitingExit ? "Awaiting exit" : item.status)).foregroundStyle(.secondary)
+                Text(item.exitCode.map { "exit \($0)" } ?? (awaitingExit ? "Awaiting exit" : item.displayStatus)).foregroundStyle(.secondary)
             }
             .font(.caption)
         }

@@ -17,12 +17,21 @@ sources. The managed installation lives under the user's Application Support.
 | Completion | A display terminal is identified by `terminal_info` or terminal content; `terminal_exit` is separate from tool completion. Read/search/list deltas have no terminal and require no exit event |
 | Permissions | `session/request_permission`; preserve backend option IDs, explicit allow/reject choices, cancel unanswered requests on stop/disconnect |
 | Files / terminals | Client filesystem and terminal capabilities are false. Codex's own workspace-scoped tools execute and emit output; this app does not provide a PTY |
-| Shutdown | Close stdin, allow the adapter supervisor to drain/stop its child, then terminate remaining owned descendants; await shutdown before capturing a cancelled task |
+| Shutdown | Track descendant identities while connected; close stdin, allow the supervisor to drain, then TERM/KILL and verify known survivors. Keep the lease until shutdown completes, before capturing cancelled changes. If known processes survive KILL, only an explicit user release ends protection, and that turn's review is marked provisional. Blocked stdin cannot block escalation; pipe errors cannot terminate the app |
 
 Session loading replays backend history, but replay does not append to an active
 turn. There is no automatic prompt retry. Unexpected methods not advertised by the
 client receive an error. Diagnostics on stderr are drained separately from JSON
 and are not persisted or displayed as assistant text.
+
+Timeline details retain up to 500 entries, with an explicit omission notice.
+Additional tools retain bounded lifecycle metadata (up to 20,000 omitted tools),
+including terminal exits and failure counts; exhausting this bound stops the turn.
+Assistant text (256 KiB) and tool output (1 MiB) truncation are marked. Cancelled or
+disconnected turns settle pending tool cards without inventing exit codes.
+Process cleanup verifies known descendants using PID and start time, including
+reparented children observed while connected; independently detached processes
+that escaped observation remain outside this guarantee.
 
 ## Turn snapshots
 
@@ -33,6 +42,13 @@ capture again and compare byte fingerprints. Include previously observed paths s
 an ignore-rule change cannot masquerade as a deletion. Native file review compares
 immutable before/after text via Git histogram; opening a file returns to its live
 version. A later turn receives a fresh baseline including manual edits.
+
+Protection checks actual canonical write targets as well as project roots.
+Unrelated windows with external tabs or symlink aliases into the running project
+also become read-only. Before a task, each window saves only its edited files inside
+that project. Save As, create, rename, duplicate and delete recheck their
+targets; buffer writes have a final guard. Save panels do not create directories,
+because their folder-creation action bypasses the application's mutation guard.
 
 Git discovery includes tracked files even if ignored, and non-ignored untracked
 files. Non-Git discovery applies nested ignore rules and normalizes macOS `/var`
@@ -67,6 +83,14 @@ Protocol references: [ACP v1](https://agentclientprotocol.com/protocol/v1/initia
 - `bash scripts/test-agent.sh`: framing, ordered RPC, permission responses, EOF,
   timeout recovery, tool patches, terminal-vs-read output, Git/non-Git snapshots,
   ignore rules, frozen history, storage bounds, path containment.
+- `bash scripts/test-agent-workspace.sh`: offline build, then the actual app's
+  workspace/coordinator/session implementation in an isolated test process:
+  cross-project Save As, symlink/external-tab editing, retargeted symlinks, nested
+  leases, cancellation, disconnect, missing exit after prompt completion, hidden
+  terminal exit and stable final snapshots after stubborn writers stop.
+- Process fixtures also cover TERM-resistant children, parent EOF/reparenting,
+  children created during shutdown and a full stdin pipe. They use disposable
+  files and never connect to an account.
 - `RUN_LIVE_CODEX_TESTS=1 bash scripts/test-agent-live.sh`: disposable synthetic
   project only; two actual Codex turns with commands and exits, added/modified/
   deleted files, manual edits, immutable first review, cancellation and partial

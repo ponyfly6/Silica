@@ -107,14 +107,14 @@ struct AppCommands: Commands {
 
         CommandGroup(replacing: .sidebar) {
             Button(workspace?.isAgentPanelVisible == true ? "Hide Codex" : "Show Codex") { workspace?.toggleAgentPanel() }
-                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .keyboardShortcut("r")
                 .disabled(workspace == nil)
 
             Divider()
             Button(workspace?.isSidebarVisible == false ? "Show Sidebar" : "Hide Sidebar") {
                 workspace?.toggleSidebar()
             }
-            .keyboardShortcut("s", modifiers: [.control, .command])
+            .keyboardShortcut("b")
             .disabled(workspace == nil)
 
             // ⇧⌘E, ⇧⌘F and ⇧⌘S are also handled by KeyWorkspace.installKeyboardShortcuts().

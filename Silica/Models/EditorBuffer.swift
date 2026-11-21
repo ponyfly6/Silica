@@ -200,6 +200,9 @@ final class EditorBuffer: Identifiable {
 
     /// Writes the text to another file (Save As), leaving this buffer as it is.
     func write(to destination: URL) throws {
+        guard !AgentWorkspaceCoordinator.shared.isLocked(destination) else {
+            throw ACPError.message("Codex is working in the destination project. Wait before saving this file.")
+        }
         guard let controller = textController else { return }
         guard let data = controller.textView.string.data(using: encoding) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding, userInfo: [NSURLErrorKey: destination])
@@ -249,6 +252,9 @@ final class EditorBuffer: Identifiable {
     }
 
     func save() throws {
+        guard !AgentWorkspaceCoordinator.shared.isLocked(url) else {
+            throw ACPError.message("Codex is working in this file’s project. Wait before saving this file.")
+        }
         guard !isUntitled, let controller = textController else { return }
         guard let data = controller.textView.string.data(using: encoding) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding, userInfo: [NSURLErrorKey: url])

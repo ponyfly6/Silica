@@ -14,7 +14,21 @@ nonisolated struct AgentTimelineItem: Identifiable {
     var contentText = ""
     var exitCode: Int?
     var hasTerminal = false
+    var terminalDidExit = false
     var outputTruncated = false
+    var textTruncated = false
+    var localStatus: String?
+
+    var displayStatus: String { localStatus ?? status }
+    var isAwaitingExit: Bool {
+        hasTerminal && exitCode == nil && !terminalDidExit && !["cancelled", "interrupted"].contains(displayStatus)
+    }
+
+    mutating func finish(_ reason: String) {
+        if isAwaitingExit || !["completed", "failed", "cancelled", "interrupted"].contains(displayStatus) {
+            localStatus = reason
+        }
+    }
 }
 
 @MainActor @Observable
@@ -32,6 +46,13 @@ final class AgentTurn: Identifiable {
     var reviewFailure: String?
     var revision = 0
     private var fallbackMessageID = UUID().uuidString
+    // Keep lifecycle metadata even after the presentation limit. If that bounded
+    // metadata store fills too, stop the turn instead of losing execution state.
+    private var hiddenTools: [String: AgentTimelineItem] = [:]
+    private(set) var entriesTruncated = false
+    private(set) var eventLimitExceeded = false
+    private static let itemLimit = 500
+    private static let hiddenToolLimit = 20_000
     private static let textLimit = 262_144
     private static let outputLimit = 1_048_576
 
@@ -39,63 +60,118 @@ final class AgentTurn: Identifiable {
 
     var storedBytes: Int { changes.reduce(0) { $0 + $1.storedBytes } }
     var hasUnfinishedCommands: Bool {
-        items.contains { $0.kind == .tool && $0.hasTerminal && $0.exitCode == nil && $0.status != "failed" }
+        items.contains { $0.kind == .tool && $0.isAwaitingExit } || hiddenTools.values.contains { $0.isAwaitingExit }
     }
 
-    func apply(_ update: ACPJSON) {
+    var omittedToolCount: Int { hiddenTools.count }
+    var timelineNotice: String? {
+        guard entriesTruncated else { return nil }
+        let failed = hiddenTools.values.filter { $0.displayStatus == "failed" || ($0.exitCode ?? 0) != 0 }.count
+        let interrupted = hiddenTools.values.filter { ["cancelled", "interrupted"].contains($0.displayStatus) }.count
+        return "Timeline details limited to 500 entries. \(hiddenTools.count) additional tools: \(failed) failed, \(interrupted) cancelled or interrupted. Their execution states are still tracked."
+    }
+
+    func finishTools(_ reason: String) {
+        for index in items.indices where items[index].kind == .tool { items[index].finish(reason) }
+        for id in Array(hiddenTools.keys) { hiddenTools[id]?.finish(reason) }
+        revision += 1
+    }
+
+    @discardableResult
+    func apply(_ update: ACPJSON) -> Bool {
         switch update["sessionUpdate"].string {
         case "agent_message_chunk":
-            guard let text = update["content"]["text"].string else { return }
+            guard let text = update["content"]["text"].string else { return true }
             let id = update["messageId"].string ?? fallbackMessageID
             if let index = items.firstIndex(where: { $0.id == id && $0.kind == .assistant }) {
-                if items[index].text.utf8.count < Self.textLimit { items[index].text += text }
-            } else if items.count < 500 {
-                items.append(AgentTimelineItem(id: id, kind: .assistant, text: String(text.prefix(Self.textLimit))))
-            }
+                let remaining = max(0, Self.textLimit - items[index].text.utf8.count)
+                items[index].text += Self.prefix(text, bytes: remaining)
+                items[index].textTruncated = items[index].textTruncated || text.utf8.count > remaining
+            } else if items.count < Self.itemLimit {
+                items.append(AgentTimelineItem(id: id, kind: .assistant, text: Self.prefix(text, bytes: Self.textLimit),
+                                               textTruncated: text.utf8.count > Self.textLimit))
+            } else { entriesTruncated = true }
         case "tool_call", "tool_call_update":
-            guard let id = update["toolCallId"].string else { return }
-            let index: Int
-            if let existing = items.firstIndex(where: { $0.id == id && $0.kind == .tool }) { index = existing }
-            else {
-                guard items.count < 500 else { return }
-                items.append(AgentTimelineItem(id: id, kind: .tool)); index = items.count - 1
+            guard let id = update["toolCallId"].string else { return true }
+            if let index = items.firstIndex(where: { $0.id == id && $0.kind == .tool }) {
+                Self.patch(&items[index], update: update, retainDetails: true)
+            } else if hiddenTools[id] != nil || items.count >= Self.itemLimit {
+                entriesTruncated = true
+                guard hiddenTools[id] != nil || hiddenTools.count < Self.hiddenToolLimit else {
+                    eventLimitExceeded = true; revision += 1; return false
+                }
+                var tool = hiddenTools[id] ?? AgentTimelineItem(id: id, kind: .tool)
+                Self.patch(&tool, update: update, retainDetails: false)
+                hiddenTools[id] = tool
                 fallbackMessageID = UUID().uuidString
-            }
-            if let title = update["title"].string { items[index].title = String(title.prefix(16_384)) }
-            if let status = update["status"].string { items[index].status = status }
-            if let operation = update["kind"].string { items[index].operation = operation }
-            if let command = update["rawInput"]["command"].string { items[index].title = String(command.prefix(16_384)) }
-            if let cwd = update["rawInput"]["cwd"].string { items[index].cwd = cwd }
-            if update.object?["content"] != nil {
-                items[index].contentText = String(update["content"].array.compactMap { $0["content"]["text"].string }.joined(separator: "\n").prefix(Self.outputLimit))
-            }
-            let meta = update["_meta"]
-            if let cwd = meta["terminal_info"]["cwd"].string { items[index].cwd = cwd; items[index].hasTerminal = true }
-            if update["content"].array.contains(where: { $0["type"].string == "terminal" }) { items[index].hasTerminal = true }
-            // These are the pinned Codex adapter's display-terminal metadata,
-            // also handled by Zed's ACP v1 compatibility layer.
-            if let delta = meta["terminal_output_delta"]["data"].string ?? meta["terminal_output"]["data"].string {
-                // The adapter also sends deltas for read/search/list tools, which
-                // have no display terminal and never emit terminal_exit.
-                let remaining = max(0, Self.outputLimit - items[index].output.utf8.count)
-                items[index].output += String(decoding: delta.utf8.prefix(remaining), as: UTF8.self)
-                if delta.utf8.count > remaining { items[index].outputTruncated = true }
-            }
-            if let exit = meta["terminal_exit"]["exit_code"].integer { items[index].exitCode = exit }
-            if let signal = meta["terminal_exit"]["signal"].string {
-                items[index].status = "failed"
-                items[index].output += "\nTerminated by signal \(signal)"
+            } else {
+                var tool = AgentTimelineItem(id: id, kind: .tool)
+                Self.patch(&tool, update: update, retainDetails: true)
+                items.append(tool)
+                fallbackMessageID = UUID().uuidString
             }
         case "plan":
             let text = update["entries"].array.compactMap { item -> String? in
                 guard let content = item["content"].string else { return nil }
                 return "\(item["status"].string ?? "pending"): \(content)"
             }.joined(separator: "\n")
-            if let index = items.firstIndex(where: { $0.id == "plan" }) { items[index].text = String(text.prefix(Self.textLimit)) }
-            else if !text.isEmpty { items.append(AgentTimelineItem(id: "plan", kind: .notice, title: "Plan", text: String(text.prefix(Self.textLimit)))) }
-        default: return
+            if let index = items.firstIndex(where: { $0.id == "plan" }) {
+                items[index].text = Self.prefix(text, bytes: Self.textLimit)
+                items[index].textTruncated = text.utf8.count > Self.textLimit
+            } else if !text.isEmpty, items.count < Self.itemLimit {
+                items.append(AgentTimelineItem(id: "plan", kind: .notice, title: "Plan", text: Self.prefix(text, bytes: Self.textLimit),
+                                               textTruncated: text.utf8.count > Self.textLimit))
+            } else if !text.isEmpty { entriesTruncated = true }
+        default: return true
         }
         revision += 1
+        return true
+    }
+
+    private static func patch(_ item: inout AgentTimelineItem, update: ACPJSON, retainDetails: Bool) {
+        if let status = update["status"].string { item.status = status }
+        let meta = update["_meta"]
+        if meta["terminal_info"].object != nil || update["content"].array.contains(where: { $0["type"].string == "terminal" }) {
+            item.hasTerminal = true
+        }
+        if let exit = meta["terminal_exit"]["exit_code"].integer { item.exitCode = exit }
+        if meta["terminal_exit"].object != nil { item.terminalDidExit = true }
+        if meta["terminal_exit"]["signal"].string != nil { item.status = "failed" }
+        guard retainDetails else { return }
+        if let title = update["rawInput"]["command"].string ?? update["title"].string {
+            item.title = prefix(title, bytes: 16_384)
+            item.textTruncated = item.textTruncated || title.utf8.count > 16_384
+        }
+        if let operation = update["kind"].string { item.operation = operation }
+        if let cwd = meta["terminal_info"]["cwd"].string ?? update["rawInput"]["cwd"].string { item.cwd = cwd }
+        if update.object?["content"] != nil {
+            let text = update["content"].array.compactMap { $0["content"]["text"].string }.joined(separator: "\n")
+            item.contentText = prefix(text, bytes: outputLimit)
+            item.outputTruncated = item.outputTruncated || text.utf8.count > outputLimit
+        }
+        // Read/search/list deltas do not imply a terminal and need no exit event.
+        if let delta = meta["terminal_output_delta"]["data"].string ?? meta["terminal_output"]["data"].string {
+            let remaining = max(0, outputLimit - item.output.utf8.count)
+            item.output += prefix(delta, bytes: remaining)
+            item.outputTruncated = item.outputTruncated || delta.utf8.count > remaining
+        }
+        if let signal = meta["terminal_exit"]["signal"].string {
+            let suffix = "\nTerminated by signal \(signal)"
+            let remaining = max(0, outputLimit - item.output.utf8.count)
+            item.output += prefix(suffix, bytes: remaining)
+            item.outputTruncated = item.outputTruncated || suffix.utf8.count > remaining
+        }
+    }
+
+    private static func prefix(_ text: String, bytes limit: Int) -> String {
+        guard text.utf8.count > limit else { return text }
+        let bytes = text.utf8.prefix(limit)
+        var end = bytes.endIndex
+        while end > bytes.startIndex {
+            if let result = String(bytes: bytes[..<end], encoding: .utf8) { return result }
+            end = bytes.index(before: end)
+        }
+        return ""
     }
 }
 

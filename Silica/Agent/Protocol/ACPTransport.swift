@@ -9,6 +9,8 @@ final class ACPTransport {
     var onDisconnect: ((String) -> Void)?
 
     private var process: Process?
+    private var processTree: AgentProcessTree?
+    private var cleanup: Task<AgentShutdownResult, Never>?
     private var input: FileHandle?
     private var stdout: FileHandle?
     private var stderr: FileHandle?
@@ -20,8 +22,10 @@ final class ACPTransport {
     private var generation = UUID()
     private(set) var isConnected = false
 
-    func start(executable: URL, cwd: URL) throws {
-        close()
+    func start(executable: URL, cwd: URL) async throws {
+        let previous = await shutdown()
+        guard previous.isComplete else { throw ACPError.message("Previous Codex processes are still stopping. Reconnect after they exit.") }
+        try Task.checkCancellation()
         let generation = UUID()
         self.generation = generation
         let stream = AsyncThrowingStream<ACPJSON, Error>.makeStream(bufferingPolicy: .bufferingOldest(512))
@@ -29,6 +33,11 @@ final class ACPTransport {
         let reader = ACPStreamReader(continuation: stream.continuation)
         let process = Process()
         let incoming = Pipe(), outgoing = Pipe(), errors = Pipe()
+        // A child can exit while the serial writer is blocked in write(2).
+        // Report EPIPE through the request path instead of terminating the app.
+        guard fcntl(outgoing.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            throw ACPError.message("Could not configure the Codex input pipe.")
+        }
         process.executableURL = executable
         process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
@@ -48,7 +57,13 @@ final class ACPTransport {
         input = outgoing.fileHandleForWriting
         stdout = incoming.fileHandleForReading
         stderr = errors.fileHandleForReading
-        do { try process.run() } catch { close(); throw error }
+        do {
+            try process.run()
+            processTree = try AgentProcessTree(pid: process.processIdentifier)
+        } catch {
+            if process.isRunning { process.terminate(); kill(process.processIdentifier, SIGKILL) }
+            close(); throw error
+        }
         isConnected = true
         consumer = Task { [weak self] in
             do {
@@ -153,64 +168,55 @@ final class ACPTransport {
         failPending(ACPError.message("The Codex connection was closed."))
         consumer?.cancel(); consumer = nil
         continuation?.finish(); continuation = nil
-        stdout?.readabilityHandler = nil
-        stderr?.readabilityHandler = nil
         let process = process
         let input = input
         let stdout = stdout
         let stderr = stderr
         self.input = nil; self.stdout = nil; self.stderr = nil; self.process = nil
-        // EOF lets the adapter dispose its Codex child; don't wait on the UI thread.
-        writes.async {
-            let descendants = process.flatMap { $0.isRunning ? AgentChildProcesses.descendants(of: $0.processIdentifier) : nil } ?? []
-            try? input?.close()
-            if let process {
-                // The adapter supervisor uses up to five seconds to drain/terminate its child.
-                let deadline = ProcessInfo.processInfo.systemUptime + 6
-                while process.isRunning, ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.01) }
-                if process.isRunning { process.terminate() }
-                let killDeadline = ProcessInfo.processInfo.systemUptime + 0.5
-                while process.isRunning, ProcessInfo.processInfo.systemUptime < killDeadline { Thread.sleep(forTimeInterval: 0.01) }
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            }
-            for pid in descendants where kill(pid, 0) == 0 { kill(pid, SIGTERM) }
+        guard process != nil || input != nil else { return }
+        let tree = processTree
+        // Preserve write ordering for EOF, but run process termination separately:
+        // a full stdin pipe must not hold shutdown hostage on the writer queue.
+        let writes = writes
+        cleanup = Task.detached {
+            let closeInput: @Sendable () -> Void = { writes.async { try? input?.close() } }
+            let result: AgentShutdownResult
+            if let tree { result = tree.shutdown(closeInput: closeInput) }
+            else { closeInput(); result = .complete }
+            if result.isComplete { process?.waitUntilExit() }
+            // Continue draining during graceful shutdown so output pipes cannot
+            // prevent the supervisor or child from exiting on their own.
+            stdout?.readabilityHandler = nil
+            stderr?.readabilityHandler = nil
             try? stdout?.close(); try? stderr?.close()
+            return result
         }
     }
 
-    func shutdown() async {
+    @discardableResult
+    func shutdown() async -> AgentShutdownResult {
         close()
+        let tree = processTree
+        var result = await cleanup?.value ?? .complete
+        if !result.isComplete, let tree {
+            let retry = Task.detached { tree.shutdown() }
+            if processTree === tree { cleanup = retry }
+            result = await retry.value
+        }
+        guard result.isComplete else { return result }
+        if processTree === tree { processTree = nil }
         await withCheckedContinuation { continuation in
             writes.async { continuation.resume() }
         }
+        return result
     }
-}
 
-nonisolated private enum AgentChildProcesses {
-    static func descendants(of parent: Int32) -> [Int32] {
-        let process = Process(), output = Pipe()
-        process.executableURL = URL(filePath: "/bin/ps")
-        process.arguments = ["-A", "-o", "pid=,ppid="]
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return [] }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let relations = String(decoding: data, as: UTF8.self).split(separator: "\n").compactMap { line -> (Int32, Int32)? in
-            let pair = line.split(whereSeparator: \.isWhitespace)
-            guard pair.count == 2, let pid = Int32(pair[0]), let ppid = Int32(pair[1]) else { return nil }
-            return (pid, ppid)
-        }
-        var found: Set<Int32> = [parent]
-        var changed = true
-        while changed {
-            changed = false
-            for (pid, ppid) in relations where found.contains(ppid) && !found.contains(pid) {
-                found.insert(pid); changed = true
-            }
-        }
-        found.remove(parent)
-        return Array(found)
+    /// At the user's request, stop tracking processes that survived TERM/KILL
+    /// (another owner, or stuck in the kernel). They stay outside this app's
+    /// control; the next connection starts a fresh tree.
+    func abandonProcesses() {
+        close()
+        processTree = nil; cleanup = nil
     }
 }
 

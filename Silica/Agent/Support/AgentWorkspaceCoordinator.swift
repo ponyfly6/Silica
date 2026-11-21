@@ -15,18 +15,20 @@ final class AgentWorkspaceCoordinator {
 
     func unregister(_ workspace: WorkspaceModel) { workspaces.remove(workspace) }
 
-    func isLocked(_ root: URL) -> Bool { leases.values.contains { AgentPaths.overlaps($0, root) } }
+    func isLocked(_ root: URL) -> Bool { root.isFileURL && leases.values.contains { AgentPaths.overlaps($0, root) } }
 
     func acquire(for workspace: WorkspaceModel) throws -> UUID {
         guard !isLocked(workspace.rootURL) else {
             throw ACPError.message("A task is already running in this project or an overlapping project window.")
         }
-        let peers = workspaces.allObjects.filter { AgentPaths.overlaps($0.rootURL, workspace.rootURL) }
-        guard peers.allSatisfy({ $0.saveBeforeAgentTurn() }) else { throw CancellationError() }
+        // Any window can have a tab or symlink into this project; each saves only those files.
+        let root = workspace.rootURL
+        guard workspaces.allObjects.allSatisfy({ $0.saveBeforeAgentTurn(in: root) }) else { throw CancellationError() }
         guard !isLocked(workspace.rootURL) else { throw ACPError.message("Another overlapping project started a task while files were being saved.") }
         let id = UUID()
         leases[id] = workspace.rootURL.resolvingSymlinksInPath()
-        for peer in peers { peer.applyAgentEditProtection() }
+        // An unrelated window can have a file (or symlink) into this project open.
+        for peer in workspaces.allObjects { peer.applyAgentEditProtection() }
         return id
     }
 

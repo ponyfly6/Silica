@@ -46,6 +46,9 @@ final class WorkspaceModel {
     @ObservationIgnored private var sidebarHiddenForAgent = false
 
     var isAgentEditingLocked: Bool { AgentWorkspaceCoordinator.shared.isLocked(rootURL) }
+    func isEditingLocked(_ url: URL) -> Bool {
+        isAgentEditingLocked || (url.isFileURL && AgentWorkspaceCoordinator.shared.isLocked(url))
+    }
     var needsCloseConfirmation: Bool { hasUnsavedChanges || agent.isBusy || agent.isConnecting }
 
     /// The project's window, to bring forward when a file is opened in it from outside.
@@ -141,6 +144,7 @@ final class WorkspaceModel {
     }
 
     func toggleAgentPanel() {
+        hideQuickOpen()
         if isAgentPanelVisible {
             isAgentPanelVisible = false
             if sidebarHiddenForAgent { isSidebarVisible = true; sidebarHiddenForAgent = false }
@@ -153,23 +157,34 @@ final class WorkspaceModel {
     }
 
     func applyAgentEditProtection() {
-        for buffer in buffers.values { buffer.textController?.textView.isEditable = !isAgentEditingLocked }
+        for buffer in buffers.values { buffer.textController?.textView.isEditable = !isEditingLocked(buffer.url) }
     }
 
-    func saveBeforeAgentTurn() -> Bool {
-        let dirty = buffers.values.filter { $0.isDirty && !$0.isUntitled }
+    /// Edited files that a task in `root` could read or overwrite, including tabs
+    /// and symlinks into it from another project. Others in this window stay unsaved.
+    func dirtyFiles(under root: URL) -> [EditorBuffer] {
+        buffers.values.filter { $0.isDirty && !$0.isUntitled && AgentPaths.overlaps($0.url, root) }
+            .sorted { $0.url.path < $1.url.path }
+    }
+
+    func saveBeforeAgentTurn(in root: URL) -> Bool {
+        let dirty = dirtyFiles(under: root)
         guard !dirty.isEmpty else { return true }
+        let names = dirty.map(\.name)
         let alert = NSAlert()
         alert.messageText = "Save changes before Codex starts?"
-        alert.informativeText = "Codex reads and writes files on disk. Save the edited files in this project window before capturing the task baseline."
+        alert.informativeText = "Codex reads and writes files on disk. Save the edited files in “\(root.lastPathComponent)” before capturing the task baseline: "
+            + names.prefix(5).joined(separator: ", ") + (names.count > 5 ? ", and \(names.count - 5) more." : ".")
         alert.addButton(withTitle: "Save and Continue")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
         return dirty.allSatisfy { save($0) }
     }
 
-    private func canModifyProject() -> Bool {
-        if isAgentEditingLocked { NSSound.beep(); return false }
+    private func canModifyProject(at urls: URL...) -> Bool {
+        if isAgentEditingLocked || urls.contains(where: { $0.isFileURL && AgentWorkspaceCoordinator.shared.isLocked($0) }) {
+            NSSound.beep(); return false
+        }
         return true
     }
 
@@ -288,6 +303,7 @@ final class WorkspaceModel {
     func refresh() {
         root.reload()
         syncOpenFilesWithDisk()
+        applyAgentEditProtection()
         search.refresh()
         // Files may have come or gone: filter a fresh list.
         treeFilterItems = nil
@@ -392,7 +408,7 @@ final class WorkspaceModel {
 
     private func makeBuffer(for url: URL) -> EditorBuffer {
         let buffer = EditorBuffer(url: url)
-        buffer.textController?.textView.isEditable = !isAgentEditingLocked
+        buffer.textController?.textView.isEditable = !isEditingLocked(url)
         // Links in a Markdown preview open other project files here, like Quick Open.
         buffer.openFile = { [weak self] target in
             self?.open(target)
@@ -534,8 +550,8 @@ final class WorkspaceModel {
     /// Starts naming a new file or folder in the tree: inside the selected folder,
     /// next to the selected file, or at the top of the project.
     func beginNewItem(isDirectory: Bool, in folder: URL? = nil) {
-        guard canModifyProject() else { return }
         let target = folder ?? selection.map { $0.hasDirectoryPath ? $0 : $0.deletingLastPathComponent() } ?? rootURL
+        guard canModifyProject(at: target) else { return }
         let node = node(for: target) ?? root
         if !node.isExpanded { node.isExpanded = true }
         showExplorer()
@@ -543,7 +559,7 @@ final class WorkspaceModel {
     }
 
     func beginRename(_ url: URL) {
-        guard canModifyProject() else { return }
+        guard canModifyProject(at: url) else { return }
         showExplorer()
         treeEdit = .rename(url)
     }
@@ -555,11 +571,11 @@ final class WorkspaceModel {
     /// Creates the file or folder named in the tree. A name with slashes creates the
     /// folders in between, as in VS Code.
     func createItem(named rawName: String, in folder: URL, isDirectory: Bool) {
-        guard canModifyProject() else { return }
         treeEdit = nil
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         let url = Self.normalized(folder.appending(path: name), isDirectory: isDirectory)
+        guard canModifyProject(at: folder, url) else { return }
         guard !FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) else {
             showAlert("“\(url.lastPathComponent)” already exists.", info: "Choose a different name.")
             return
@@ -584,7 +600,6 @@ final class WorkspaceModel {
     /// Renames in place; open tabs for the item (or anything inside a renamed folder)
     /// follow it, keeping their edits.
     func rename(_ url: URL, to rawName: String) {
-        guard canModifyProject() else { return }
         treeEdit = nil
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name != url.lastPathComponent else { return }
@@ -594,6 +609,7 @@ final class WorkspaceModel {
         }
         let isDirectory = url.hasDirectoryPath
         let destination = Self.normalized(url.deletingLastPathComponent().appending(path: name), isDirectory: isDirectory)
+        guard canModifyProject(at: url, destination) else { return }
         // A case-only change is the same file on a case-insensitive disk.
         let isCaseChange = name.lowercased() == url.lastPathComponent.lowercased()
         guard isCaseChange || !FileManager.default.fileExists(atPath: destination.path(percentEncoded: false)) else {
@@ -613,7 +629,7 @@ final class WorkspaceModel {
 
     /// Copies the item next to itself as "name copy", like Finder.
     func duplicate(_ url: URL) {
-        guard canModifyProject() else { return }
+        guard canModifyProject(at: url) else { return }
         let isDirectory = url.hasDirectoryPath
         let folder = url.deletingLastPathComponent()
         let ext = isDirectory ? "" : url.pathExtension
@@ -626,6 +642,7 @@ final class WorkspaceModel {
             copy = Self.normalized(folder.appending(path: name), isDirectory: isDirectory)
             number += 1
         } while FileManager.default.fileExists(atPath: copy.path(percentEncoded: false))
+        guard canModifyProject(at: copy) else { return }
         do {
             try FileManager.default.copyItem(at: url, to: copy)
         } catch {
@@ -639,7 +656,7 @@ final class WorkspaceModel {
     /// Moves the item to the Trash. Unedited tabs for it close; edited ones stay
     /// open, marked as deleted, so nothing typed is lost.
     func moveToTrash(_ url: URL) {
-        guard canModifyProject() else { return }
+        guard canModifyProject(at: url) else { return }
         do {
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
         } catch {
@@ -656,11 +673,10 @@ final class WorkspaceModel {
     /// Save As (⇧⌘S): writes the text to a new file, which takes the tab's place. The
     /// original file keeps what was last saved.
     func saveActiveAs() {
-        guard canModifyProject() else { return }
         guard let buffer = activeBuffer, buffer.textController != nil,
               let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        guard canModifyProject(at: buffer.url) else { return }
         let panel = savePanel(for: buffer)
-        panel.canCreateDirectories = true
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             self?.save(buffer, as: url)
@@ -672,7 +688,9 @@ final class WorkspaceModel {
         let panel = NSSavePanel()
         panel.directoryURL = buffer.isUntitled ? rootURL : buffer.url.deletingLastPathComponent()
         panel.nameFieldStringValue = buffer.name
-        panel.canCreateDirectories = true
+        // Folder creation inside the system panel bypasses our mutation guard,
+        // including when another project acquires a lease while this sheet is open.
+        panel.canCreateDirectories = false
         return panel
     }
 
@@ -680,9 +698,9 @@ final class WorkspaceModel {
     /// the file was written.
     @discardableResult
     func save(_ buffer: EditorBuffer, as url: URL) -> Bool {
-        guard canModifyProject() else { return false }
         let destination = Self.normalized(url, isDirectory: false)
         let source = buffer.url
+        guard canModifyProject(at: source, destination) else { return false }
         guard destination != source else {
             return save(buffer)
         }
@@ -841,7 +859,7 @@ final class WorkspaceModel {
 
     @discardableResult
     private func save(_ buffer: EditorBuffer) -> Bool {
-        guard canModifyProject() else { return false }
+        guard canModifyProject(at: buffer.url) else { return false }
         // Untitled: ask where, in a panel of its own (this runs inside other prompts).
         if buffer.isUntitled {
             let panel = savePanel(for: buffer)
@@ -908,15 +926,24 @@ final class WorkspaceModel {
     /// saved, or the user chose not to save.
     func confirmClosing(in window: NSWindow, completion: @escaping (Bool) -> Void) {
         if agent.isBusy || agent.isConnecting {
+            let survivors = agent.survivingProcessIDs
             let alert = NSAlert()
-            alert.messageText = "Codex is still working in this window."
-            alert.informativeText = "Stopping closes this connection. Files already changed remain on disk and the final changes are captured before closing."
-            alert.addButton(withTitle: "Keep Open")
-            alert.addButton(withTitle: "Stop and Close")
+            if survivors.isEmpty {
+                alert.messageText = "Codex is still working in this window."
+                alert.informativeText = "Stopping closes this connection. Files already changed remain on disk and the final changes are captured before closing."
+                alert.addButton(withTitle: "Keep Open")
+                alert.addButton(withTitle: "Stop and Close")
+            } else {
+                alert.messageText = "Some Codex processes did not stop."
+                alert.informativeText = "Processes \(survivors.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files in this project after the window closes."
+                alert.addButton(withTitle: "Keep Open")
+                alert.addButton(withTitle: "Close Anyway")
+            }
             alert.beginSheetModal(for: window) { [weak self] response in
                 guard let self, response == .alertSecondButtonReturn else { completion(false); return }
                 Task {
-                    await self.agent.stopAndDisconnect()
+                    if survivors.isEmpty { await self.agent.stopAndDisconnect() }
+                    else { await self.agent.releaseSurvivingProcesses() }
                     self.confirmClosing(in: window, completion: completion)
                 }
             }

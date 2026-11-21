@@ -12,7 +12,7 @@ Install Node.js and sign in with `codex login`, then install the pinned adapter:
 bash scripts/install-codex-acp.sh
 ```
 
-Open a project in the development app and press **⇧⌘A**. Send a question or task;
+Open a project in the development app and press **⌘R** to focus the chat input. Send a question or task;
 the panel connects automatically using your existing Codex login. Model, reasoning
 effort and workspace/read-only mode come from the backend. Commands show their
 output and exit status; permission requests require an explicit choice. **Stop**
@@ -59,6 +59,7 @@ Build with the existing Silica scheme. Core diff checks run with:
 ```sh
 bash scripts/test-review.sh
 bash scripts/test-agent.sh
+bash scripts/test-agent-workspace.sh  # Offline app build + real workspace/session checks
 # Optional: uses your Codex account on disposable synthetic projects.
 RUN_LIVE_CODEX_TESTS=1 bash scripts/test-agent-live.sh
 ```
@@ -118,7 +119,8 @@ Silica needs macOS 26 or later.
 | ⌥⌘J | Filter files in the tree |
 | ⌘L | Go to Line |
 | ⇧⌘V | Toggle Markdown preview |
-| ⌃⌘S | Show or hide the sidebar |
+| ⌘B or ⌃⌘S | Show or hide the sidebar |
+| ⌘R or ⇧⌘A | Show or hide Codex chat (opening focuses the message input) |
 | ⌘/ | Toggle comment |
 | ⌥↑ / ⌥↓ | Move lines up or down |
 | ⇧⌥↑ / ⇧⌥↓ | Duplicate lines up or down |
