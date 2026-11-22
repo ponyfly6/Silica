@@ -8,6 +8,35 @@ struct AgentCoreTests {
         func check(_ condition: @autoclosure () -> Bool, _ message: String) {
             precondition(condition(), message); count += 1
         }
+        let preferred = 700.0
+        let narrow = WorkspaceLayout.panelWidth(preferred: preferred, available: 920)
+        check(narrow == 500 && 920 - narrow == WorkspaceLayout.minimumEditorWidth, "Narrow window squeezed the editor")
+        check(WorkspaceLayout.panelWidth(preferred: preferred, available: 1300) == preferred, "Wider window lost the preferred width")
+        check(WorkspaceLayout.panelWidth(preferred: 250, available: 720) == 300, "Panel fell below its minimum")
+        check(WorkspaceLayout.panelWidth(preferred: 900, available: 1600) == 820, "Panel exceeded its maximum")
+
+        let grouped: ACPJSON = .object(["id": .string("fixture-effort"), "category": .string("thought_level"),
+            "type": .string("select"), "currentValue": .string("medium"), "options": .array([
+                .object(["options": .array([.object(["value": .string("medium")])])]),
+                .object(["options": .array([.object(["value": .string("high"), "name": .string("High")])])])
+            ])])
+        let levels = AgentConfigOption.parse(.array([grouped]))
+        check(levels.first?.choices.map(\.name) == ["medium", "High"], "Grouped choices lost their order or display names")
+        let model = AgentConfigOption(id: "backend-model", name: "Model", category: "model", value: "standard",
+                                      choices: [.init(id: "small", name: "Small")])
+        let options = levels + [model]
+        check(AgentPreference.allCases == [.model, .thoughtLevel], "Reasoning must be restored after the model")
+        check(AgentPreference.model.option(toApply: "small", in: options)?.id == model.id &&
+              AgentPreference.thoughtLevel.option(toApply: "high", in: options)?.id == "fixture-effort", "Lost adapter-specific option IDs")
+        check(AgentPreference.model.option(toApply: "removed", in: options) == nil, "Applied an unavailable model")
+        check(AgentPreference.thoughtLevel.option(toApply: "medium", in: options) == nil, "Reapplied the current level")
+        let reduced = AgentConfigOption(id: "fixture-effort", name: "Effort", category: "thought_level", value: "low",
+                                        choices: [.init(id: "low", name: "Low")])
+        check(AgentPreference.thoughtLevel.option(toApply: "high", in: [model, reduced]) == nil, "Applied a level missing after the model change")
+        for preference in AgentPreference.allCases {
+            check(preference.key(for: .codex) != preference.key(for: .claude), "Agents share a preference key")
+        }
+
         let frame = Data("{\"method\":\"test\",\"params\":{\"text\":\"🐱é\"}}\r\n".utf8)
         var decoder = ACPLineDecoder()
         var values: [ACPJSON] = []
@@ -233,7 +262,7 @@ struct AgentCoreTests {
             let later = try Data(contentsOf: heartbeat)
             check(frozen == later, "\(method): a child continued writing after shutdown returned")
         }
-        print("PASS: \(count) agent discovery, mode policy, ACP framing, ordered dispatch, RPC, tool events, process cleanup and edited-file checks")
+        print("PASS: \(count) panel sizing, agent preferences, discovery, mode policy, ACP framing, ordered dispatch, RPC, tool events, process cleanup and edited-file checks")
     }
 
     nonisolated static func isRunning(_ pid: Int32) -> Bool {

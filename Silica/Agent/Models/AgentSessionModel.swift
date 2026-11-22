@@ -103,6 +103,31 @@ final class AgentSessionModel {
         guard let sessionID else { throw ACPError.message("\(kind.displayName) did not create a session. \(kind.loginHint)") }
         configOptions = try await kind.sessionOptions(response, sessionID: sessionID, transport: transport)
         isConnected = true
+        for preference in AgentPreference.allCases {
+            guard let value = UserDefaults.standard.string(forKey: preference.key(for: kind)),
+                  let option = preference.option(toApply: value, in: configOptions) else { continue }
+            do { try await updateConfiguration(option, value: value, sessionID: sessionID) }
+            catch {
+                guard isConnected, !Task.isCancelled else { throw error }
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func updateConfiguration(_ option: AgentConfigOption, value: String, sessionID: String) async throws {
+        let response = try await transport.request("session/set_config_option", params: .object([
+            "sessionId": .string(sessionID), "configId": .string(option.id), "value": .string(value)
+        ]))
+        try Task.checkCancellation()
+        if case .array = response["configOptions"] {
+            applyConfiguration(response["configOptions"])
+        } else {
+            throw ACPError.message("\(kind.displayName) did not return updated configuration options.")
+        }
+        guard isConnected else { throw ACPError.message(errorMessage ?? "Disconnected") }
+        guard configOptions.contains(where: { $0.id == option.id && $0.category == option.category && $0.value == value }) else {
+            throw ACPError.message("\(kind.displayName) did not confirm \(option.name) “\(value)”.")
+        }
     }
 
     func setConfiguration(_ option: AgentConfigOption, value: String) {
@@ -114,10 +139,11 @@ final class AgentSessionModel {
             guard let self else { return }
             defer { self.isConnecting = false }
             do {
-                let response = try await transport.request("session/set_config_option", params: .object([
-                    "sessionId": .string(sessionID), "configId": .string(option.id), "value": .string(value)
-                ]))
-                applyConfiguration(response["configOptions"])
+                try await updateConfiguration(option, value: value, sessionID: sessionID)
+                if let preference = AgentPreference(rawValue: option.category) {
+                    UserDefaults.standard.set(value, forKey: preference.key(for: kind))
+                }
+                errorMessage = nil
             } catch { errorMessage = error.localizedDescription }
         }
     }
@@ -267,15 +293,16 @@ final class AgentSessionModel {
         guard !isBusy, !isConnecting else { return }
         operation?.cancel(); transport.close(); isConnected = false
         sessionID = nil; turns = []; configOptions = []; errorMessage = nil; agentVersion = ""
+        if workspace?.isAgentPanelVisible == true { connect() }
     }
 
     func selectAgent(_ selected: AgentKind) {
         guard kind != selected, !isBusy, !isConnecting, survivingProcessIDs.isEmpty else { return }
-        newChat()
         draft = ""
         kind = selected
         executablePath = UserDefaults.standard.string(forKey: selected.executableKey) ?? ""
         UserDefaults.standard.set(selected.rawValue, forKey: "selectedAgent")
+        newChat()
     }
 
     func close() {

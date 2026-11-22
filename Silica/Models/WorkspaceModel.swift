@@ -126,10 +126,16 @@ final class WorkspaceModel {
             isAgentPanelVisible = false
             if sidebarHiddenForAgent { isSidebarVisible = true; sidebarHiddenForAgent = false }
         } else {
-            if isSidebarVisible, (window?.contentView?.bounds.width ?? 1180) < 1040 {
+            let defaults = UserDefaults.standard
+            let sidebar = defaults.object(forKey: "sidebarWidth") as? Double ?? WorkspaceLayout.defaultSidebarWidth
+            let panel = defaults.object(forKey: "agentPanelWidth") as? Double ?? WorkspaceLayout.defaultPanelWidth
+            let needed = WorkspaceLayout.clampedSidebarWidth(sidebar) + WorkspaceLayout.minimumEditorWidth
+                + WorkspaceLayout.panelWidth(preferred: panel, available: .infinity)
+            if isSidebarVisible, let width = window?.contentView?.bounds.width, width < needed {
                 isSidebarVisible = false; sidebarHiddenForAgent = true
             }
             isAgentPanelVisible = true
+            agent.connect()
         }
     }
 

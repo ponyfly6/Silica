@@ -71,3 +71,14 @@ nonisolated enum AgentKind: String, CaseIterable {
         return candidates.first(where: executable)
     }
 }
+
+nonisolated enum AgentPreference: String, CaseIterable {
+    // A model change can replace the available reasoning levels.
+    case model, thoughtLevel = "thought_level"
+
+    func key(for kind: AgentKind) -> String { "agent.\(kind.rawValue).\(rawValue)" }
+
+    func option(toApply value: String, in options: [AgentConfigOption]) -> AgentConfigOption? {
+        options.first { $0.category == rawValue && $0.value != value && $0.choices.contains { $0.id == value } }
+    }
+}

@@ -28,15 +28,16 @@ npm runtimes under `~/Library/Application Support/Silica Workbench/`.
 | Claude Code | `bash scripts/install-claude-acp.sh` (adapter 0.109.0, requires Node.js 22+) | Run `claude` and log in. |
 
 Press **⌘R** in a project and choose **Codex** or **Claude Code** at the top of
-the panel. Sending a message connects with that agent’s existing login. Switch
+the panel. Opening the panel connects with that agent’s existing login. Drag its
+left edge to resize it, or double-click the edge to reset its width. Switch
 agents while idle to start a fresh chat in this window. New windows remember the
 last selection. Connection settings show the adapter version, login instructions
 and a separate executable override for each agent. If your login expires, sign
 in again in Terminal and reconnect.
 
-The panel shows the backend's model,
-reasoning and workspace permission choices, streams command output, and asks
-for tool permissions. **Stop** cancels a task. **End Connection** becomes
+Choose the model, reasoning level and permission mode next to **Send**. Silica
+remembers the model and reasoning level for each agent. The panel streams
+command output and asks for tool permissions. **Stop** cancels a task. **End Connection** becomes
 available if cancellation stalls. A running task holds a lease across windows
 that open the same project or a parent or child folder.
 

@@ -41,12 +41,30 @@ while time.monotonic() < deadline:
     pathlib.Path("writer.pid").write_text(str(child.pid))
 
 
-def mode_options(current, values):
-    return [{"type": "select", "id": "permission-mode", "category": "mode", "name": "Mode",
-             "currentValue": current, "options": [{"value": value, "name": value} for value in values]}]
+def select_option(ident, category, current, values):
+    return {"type": "select", "id": ident, "category": category, "name": category,
+            "currentValue": current, "options": [{"value": v, "name": v.title()} for v in values]}
+
+
+def levels():
+    return ["medium", "low"] if model == "small" else ["medium", "low", "high"]
+
+
+def config_options():
+    options = [select_option("model", "model", model, ["standard", "small"]),
+               select_option(effort_id, "thought_level", effort, levels())]
+    if claude:
+        options.append(select_option("permission-mode", "mode", mode, ["bypassPermissions", "auto", "default"]))
+    return options
+
+
+def record(call):
+    with open("config-calls", "a") as log:
+        print(call, file=log)
 
 
 claude = pathlib.Path(sys.argv[0]).name == "claude-fixture"
+effort_id = "effort" if claude else "reasoning_effort"
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
@@ -54,17 +72,35 @@ for line in sys.stdin:
     if method == "initialize":
         respond(ident, {"protocolVersion": 1, "agentInfo": {"version": "offline"}, "agentCapabilities": {"loadSession": True}})
     elif method in ("session/new", "session/load"):
-        if claude:
-            assert method == "session/new" and "INITIAL_AGENT_MODE" not in os.environ
-            options = mode_options("bypassPermissions", ["bypassPermissions", "auto", "default"])
-        else:
-            assert os.environ.get("INITIAL_AGENT_MODE") == "workspace-write"
-            options = []
-        respond(ident, {"sessionId": SESSION, "configOptions": options})
+        assert os.environ.get("INITIAL_AGENT_MODE") == (None if claude else "workspace-write")
+        record(method)
+        model, effort, mode = "standard", "medium", "bypassPermissions"
+        respond(ident, {"sessionId": SESSION, "configOptions": config_options()})
     elif method == "session/set_config_option":
-        assert claude and request["params"] == {"sessionId": SESSION, "configId": "permission-mode", "value": "auto"}
-        pathlib.Path("selected-mode").write_text(request["params"]["value"])
-        respond(ident, {"configOptions": mode_options("auto", ["bypassPermissions", "auto", "default"])})
+        params = request["params"]
+        assert params["sessionId"] == SESSION
+        key, value = params["configId"], params["value"]
+        record(f"{key}={value}")
+        rejection = pathlib.Path("reject-option")
+        if rejection.exists():
+            if rejection.read_text() == "unconfirmed":
+                respond(ident, {"configOptions": config_options()})
+            else:
+                emit({"jsonrpc": "2.0", "id": ident, "error": {"code": -32602, "message": "Fixture rejected option"}})
+            continue
+        if key == "permission-mode":
+            assert claude and value == "auto"
+            mode = value
+            pathlib.Path("selected-mode").write_text(value)
+        elif key == "model":
+            assert value in ["standard", "small"]
+            model = value
+            if effort not in levels():
+                effort = "medium"
+        else:
+            assert key == effort_id and value in levels()
+            effort = value
+        respond(ident, {"configOptions": config_options()})
     elif method == "session/cancel":
         if pending_prompt and not ignore_cancel:
             respond(pending_prompt, {"stopReason": "cancelled"})

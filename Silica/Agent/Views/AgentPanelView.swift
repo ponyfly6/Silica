@@ -55,7 +55,6 @@ struct AgentPanelView: View {
             .glassEffect(.regular, in: .rect(cornerRadius: WorkspaceLayout.cardCornerRadius))
             .padding([.trailing, .bottom], WorkspaceLayout.cardInset)
         }
-        .frame(width: 360)
     }
 
     private var connectionBar: some View {
@@ -81,14 +80,6 @@ struct AgentPanelView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text(model.kind.loginHint)
                     .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(model.configOptions.filter { ["mode", "model", "thought_level"].contains($0.category) }) { option in
-                Picker(option.name, selection: Binding(get: { option.value }, set: { model.setConfiguration(option, value: $0) })) {
-                    ForEach(option.choices.filter { option.category != "mode" || model.kind.allowedModes.contains($0.id) }) { choice in
-                        Text(choice.name).tag(choice.id)
-                    }
-                }
-                .font(.caption).controlSize(.small).disabled(model.isBusy || model.isConnecting || !model.isConnected)
             }
         }
         .padding(10)
@@ -119,6 +110,27 @@ struct AgentPanelView: View {
         }
     }
 
+    @ViewBuilder private func configurationMenu(_ category: String, label: String) -> some View {
+        let option = model.configOptions.first { $0.category == category }
+        if let option {
+            let choices = option.choices.filter { category != "mode" || model.kind.allowedModes.contains($0.id) }
+            let selected = choices.first { $0.id == option.value }?.name ?? option.value
+            Menu {
+                Picker(option.name, selection: Binding(get: { option.value }, set: { model.setConfiguration(option, value: $0) })) {
+                    ForEach(choices) { choice in Text(choice.name).tag(choice.id) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Text(selected).lineLimit(1)
+            }
+            .disabled(!model.isConnected || model.isBusy || model.isConnecting || choices.isEmpty)
+            .accessibilityLabel(label).accessibilityValue(selected)
+            .help("\(label): \(selected)")
+        } else if !model.isConnected {
+            Menu(label) {}.disabled(true)
+        }
+    }
+
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Message \(model.kind.displayName)").font(.caption).foregroundStyle(.secondary)
@@ -134,19 +146,28 @@ struct AgentPanelView: View {
                 .frame(minHeight: 60, idealHeight: 80, maxHeight: 120)
                 .padding(5).background(.primary.opacity(0.04), in: .rect(cornerRadius: 8))
                 .accessibilityLabel("Message \(model.kind.displayName)")
-            HStack {
-                Spacer(minLength: 0)
-                if !model.survivingProcessIDs.isEmpty {
-                    Button("Release Project…", role: .destructive) { confirmsRelease = true }.controlSize(.small)
-                } else if model.canForceDisconnect {
-                    Button("End Connection", role: .destructive) { model.disconnect() }.controlSize(.small)
-                } else if model.isBusy {
-                    Button("Stop") { model.stop() }.disabled(model.isStopping).controlSize(.small)
-                } else {
-                    Button("Send") { model.send() }
-                        .buttonStyle(.borderedProminent).controlSize(.small)
-                        .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isConnecting)
+            HStack(spacing: 4) {
+                Group {
+                    configurationMenu("model", label: "Model")
+                    configurationMenu("thought_level", label: "Reasoning")
+                    configurationMenu("mode", label: "Permissions")
                 }
+                .menuStyle(.borderlessButton).controlSize(.mini).font(.caption).lineLimit(1)
+                Spacer(minLength: 0)
+                Group {
+                    if !model.survivingProcessIDs.isEmpty {
+                        Button("Release Project…", role: .destructive) { confirmsRelease = true }.controlSize(.small)
+                    } else if model.canForceDisconnect {
+                        Button("End Connection", role: .destructive) { model.disconnect() }.controlSize(.small)
+                    } else if model.isBusy {
+                        Button("Stop") { model.stop() }.disabled(model.isStopping).controlSize(.small)
+                    } else {
+                        Button("Send") { model.send() }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                            .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isConnecting)
+                    }
+                }
+                .fixedSize()
             }
         }
         .padding(10)

@@ -70,34 +70,45 @@ struct WorkspaceWindow: View {
     }
 }
 
-enum WorkspaceLayout {
-    /// Height of the title bar row that holds the traffic lights and the tabs.
-    static let titleBarHeight: CGFloat = 36
-    /// Room for the traffic lights when the sidebar is hidden.
-    static let trafficLightsWidth: CGFloat = 78
-    /// Smallest corner radius of the editor card; corners near the window's are concentric with it.
-    static let cardCornerRadius: CGFloat = 10
-    static let cardInset: CGFloat = 6
-    /// How much of the sidebar list's built-in top inset to hide.
-    static let sidebarListTopTrim: CGFloat = 8
-    static let sidebarWidthRange: ClosedRange<Double> = 220...480
-}
-
 struct WorkspaceView: View {
     @Bindable var workspace: WorkspaceModel
-    @AppStorage("sidebarWidth") private var sidebarWidth: Double = 260
+    @AppStorage("sidebarWidth") private var sidebarWidth = WorkspaceLayout.defaultSidebarWidth
+    @AppStorage("agentPanelWidth") private var agentPanelWidth = WorkspaceLayout.defaultPanelWidth
     @State private var dragStartWidth: Double?
 
+    private var visibleSidebarWidth: Double {
+        workspace.isSidebarVisible ? WorkspaceLayout.clampedSidebarWidth(sidebarWidth) : 0
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            if workspace.isSidebarVisible {
-                FileTreeView(workspace: workspace)
-                    .frame(width: min(max(sidebarWidth, WorkspaceLayout.sidebarWidthRange.lowerBound), WorkspaceLayout.sidebarWidthRange.upperBound))
-                    .overlay(alignment: .trailing) { resizeHandle }
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+        GeometryReader { geometry in
+            let available = geometry.size.width - visibleSidebarWidth
+            let panelWidth = WorkspaceLayout.panelWidth(preferred: agentPanelWidth, available: available)
+            HStack(spacing: 0) {
+                if workspace.isSidebarVisible {
+                    FileTreeView(workspace: workspace)
+                        .frame(width: visibleSidebarWidth)
+                        .overlay(alignment: .trailing) {
+                            resizeHandle(leading: false, width: visibleSidebarWidth) { proposed in
+                                let reserved = workspace.isAgentPanelVisible ? WorkspaceLayout.panelWidthRange.lowerBound : 0
+                                sidebarWidth = WorkspaceLayout.clampedSidebarWidth(min(proposed, geometry.size.width - reserved - WorkspaceLayout.minimumEditorWidth))
+                            }
+                        }
+                        .transition(.move(edge: .leading).combined(with: .opacity))
+                }
+                EditorArea(workspace: workspace)
+                if workspace.isAgentPanelVisible {
+                    AgentPanelView(model: workspace.agent, workspace: workspace)
+                        .frame(width: panelWidth)
+                        .overlay(alignment: .leading) {
+                            resizeHandle(leading: true, width: panelWidth) { proposed in
+                                let width = WorkspaceLayout.panelWidth(preferred: proposed, available: available)
+                                if width != panelWidth { agentPanelWidth = width }
+                            }
+                            .onTapGesture(count: 2) { agentPanelWidth = WorkspaceLayout.defaultPanelWidth }
+                        }
+                }
             }
-            EditorArea(workspace: workspace)
-            if workspace.isAgentPanelVisible { AgentPanelView(model: workspace.agent, workspace: workspace) }
         }
         .ignoresSafeArea(.container, edges: .top)
         .overlay {
@@ -105,8 +116,8 @@ struct WorkspaceView: View {
                 QuickOpenOverlay(workspace: workspace)
             }
         }
-        .frame(minWidth: workspace.isAgentPanelVisible
-               ? 780 + (workspace.isSidebarVisible ? min(max(sidebarWidth, 220), 480) : 0) : 640,
+        .frame(minWidth: max(640, visibleSidebarWidth + WorkspaceLayout.minimumEditorWidth
+                             + (workspace.isAgentPanelVisible ? WorkspaceLayout.panelWidthRange.lowerBound : 0)),
                minHeight: workspace.isAgentPanelVisible ? 520 : 400)
         .containerBackground(for: .window) {
             VisualEffectView()
@@ -119,21 +130,18 @@ struct WorkspaceView: View {
         }
     }
 
-    /// Invisible strip on the sidebar's trailing edge that resizes it.
-    private var resizeHandle: some View {
+    private func resizeHandle(leading: Bool, width: Double, resize: @escaping (Double) -> Void) -> some View {
         Color.clear
             .frame(width: 8)
             .contentShape(.rect)
-            .offset(x: 4)
-            .pointerStyle(.frameResize(position: .trailing))
+            .offset(x: leading ? -4 : 4)
+            .pointerStyle(.frameResize(position: leading ? .leading : .trailing))
             .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { value in
-                        let start = dragStartWidth ?? sidebarWidth
+                        let start = dragStartWidth ?? width
                         dragStartWidth = start
-                        let proposed = start + value.translation.width
-                        sidebarWidth = min(max(proposed, WorkspaceLayout.sidebarWidthRange.lowerBound),
-                                           WorkspaceLayout.sidebarWidthRange.upperBound)
+                        resize(start + (leading ? -value.translation.width : value.translation.width))
                     }
                     .onEnded { _ in dragStartWidth = nil }
             )

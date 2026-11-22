@@ -100,6 +100,75 @@ struct AgentWorkspaceTests {
               "Switching back lost the Codex executable or changed another window")
         await viewer.agent.stopAndDisconnect()
 
+        let log = project.appending(path: "config-calls")
+        try FileManager.default.removeItem(at: log)
+        func checkConnection(_ calls: [String]) async throws {
+            try await waitUntil { !viewer.agent.isConnecting }
+            check(viewer.agent.isConnected, viewer.agent.errorMessage ?? "Panel did not connect")
+            check(tryContents(log)?.split(separator: "\n").map(String.init) == calls, "Unexpected ACP calls: \(tryContents(log) ?? "none")")
+            try FileManager.default.removeItem(at: log)
+        }
+
+        let defaults = UserDefaults.standard
+        let modelKey = AgentPreference.model.key(for: .codex)
+        let levelKey = AgentPreference.thoughtLevel.key(for: .codex)
+        defaults.set("retired", forKey: modelKey)
+        defaults.set("high", forKey: levelKey)
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 1120, height: 600), styleMask: .borderless,
+                              backing: .buffered, defer: true)
+        viewer.window = window
+        defaults.set(260.0, forKey: "sidebarWidth")
+        defaults.set(650.0, forKey: "agentPanelWidth")
+        viewer.toggleAgentPanel()
+        check(!viewer.isSidebarVisible, "Panel opening ignored the preferred width when deciding whether to hide the sidebar")
+        try await checkConnection(["session/new", "reasoning_effort=high"])
+        check(viewer.agent.errorMessage == nil, "An unavailable model caused a connection error")
+
+        func choose(_ category: String, _ value: String) {
+            let option = viewer.agent.configOptions.first { $0.category == category }!
+            viewer.agent.setConfiguration(option, value: value)
+        }
+        choose("model", "small")
+        try await checkConnection(["model=small"])
+        check(defaults.string(forKey: modelKey) == "small" && defaults.string(forKey: levelKey) == "high",
+              "Model selection did not save independently of the adapter's adjusted effort")
+        viewer.agent.newChat()
+        try await checkConnection(["session/new", "model=small"])
+        check(viewer.agent.errorMessage == nil, "Tried to restore high after the small model removed it")
+
+        choose("thought_level", "low")
+        try await checkConnection(["reasoning_effort=low"])
+        check(defaults.string(forKey: levelKey) == "low", "Confirmed reasoning level was not saved")
+        viewer.agent.newChat()
+        try await checkConnection(["session/new", "model=small", "reasoning_effort=low"])
+        viewer.agent.disconnect()
+        try await waitUntil { !viewer.agent.isConnecting }
+        check(!viewer.agent.isConnected && !FileManager.default.fileExists(atPath: log.path), "Disconnect reconnected a visible panel")
+        viewer.agent.connect()
+        try await checkConnection(["session/load", "model=small", "reasoning_effort=low"])
+
+        defaults.set("high", forKey: AgentPreference.thoughtLevel.key(for: .claude))
+        viewer.agent.selectAgent(.claude)
+        try await checkConnection(["session/new", "permission-mode=auto", "effort=high"])
+        viewer.agent.selectAgent(.codex)
+        try await checkConnection(["session/new", "model=small", "reasoning_effort=low"])
+
+        let rejection = project.appending(path: "reject-option")
+        try Data("unconfirmed".utf8).write(to: rejection)
+        choose("model", "standard")
+        try await checkConnection(["model=standard"])
+        check(defaults.string(forKey: modelKey) == "small" && viewer.agent.errorMessage?.contains("did not confirm") == true,
+              "Persisted a model change the adapter did not confirm")
+        try Data("reject".utf8).write(to: rejection)
+        viewer.agent.newChat()
+        try await checkConnection(["session/new", "model=small", "reasoning_effort=low"])
+        check(viewer.agent.errorMessage?.contains("Fixture rejected option") == true, "Lost non-fatal preference error")
+        try FileManager.default.removeItem(at: rejection)
+        viewer.toggleAgentPanel()
+        check(viewer.isSidebarVisible, "Closing the panel did not restore the sidebar")
+        viewer.agent.newChat()
+        check(!viewer.agent.isConnected && !viewer.agent.isConnecting, "New Chat connected a hidden panel")
+
         for scenario in ["cancel", "disconnect", "force-disconnect", "wait-after-response", "overflow"] {
             let folder = root.appending(path: scenario)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -144,7 +213,7 @@ struct AgentWorkspaceTests {
                 check(frozen != nil && frozen == tryContents(folder.appending(path: "heartbeat")), "\(scenario): heartbeat changed after lease release")
             }
         }
-        print("PASS: \(count) read-only viewer, workspace lease and AgentSessionModel lifecycle checks")
+        print("PASS: \(count) read-only viewer, workspace lease, agent preferences and session lifecycle checks")
     }
 
     @MainActor static func waitUntil(_ condition: () -> Bool) async throws {

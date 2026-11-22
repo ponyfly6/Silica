@@ -28,7 +28,7 @@ struct EditorArea: View {
                 .padding(.leading, workspace.isSidebarVisible ? 0 : WorkspaceLayout.cardInset)
                 .padding([.trailing, .bottom], WorkspaceLayout.cardInset)
         }
-        .frame(minWidth: 420)
+        .frame(minWidth: WorkspaceLayout.minimumEditorWidth)
     }
 
     private var editorCard: some View {
