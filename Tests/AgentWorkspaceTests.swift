@@ -15,90 +15,91 @@ struct AgentWorkspaceTests {
             try? FileManager.default.removeItem(at: root)
             UserDefaults.standard.removePersistentDomain(forName: ProcessInfo.processInfo.processName)
         }
-        let a = root.appending(path: "a"), b = root.appending(path: "b")
-        for folder in [a, b] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
-        let protectedFile = a.appending(path: "file.txt")
-        let otherFile = b.appending(path: "other.txt")
-        let alias = b.appending(path: "alias.txt")
-        try Data("original\n".utf8).write(to: protectedFile)
-        try Data("other\n".utf8).write(to: otherFile)
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: protectedFile)
-        let workspaceA = WorkspaceModel(rootURL: a), workspaceB = WorkspaceModel(rootURL: b)
-        defer { workspaceA.close(); workspaceB.close() }
-        workspaceA.open(protectedFile)
-        workspaceB.newUntitledFile()
-        let untitled = workspaceB.activeBuffer!
-        workspaceB.open(otherFile)
-        workspaceB.open(alias)
-        workspaceB.open(protectedFile)
-        // Only edits a task could touch are saved first; others in that window stay unsaved.
-        let unrelatedEdit = workspaceB.buffers[otherFile]!
-        unrelatedEdit.isDirty = true
-        workspaceB.buffers[alias]!.isDirty = true
-        check(workspaceB.dirtyFiles(under: a).map(\.url) == [alias], "Pre-task save must cover aliases into the project and nothing else")
-        workspaceB.buffers[alias]!.isDirty = false
-        // With an unrelated edit pending, acquiring must not prompt (a modal would hang here).
-        let lease = try AgentWorkspaceCoordinator.shared.acquire(for: workspaceA)
-        check(unrelatedEdit.isDirty && tryContents(otherFile) == "other\n", "Starting a task saved an unrelated file in another window")
-        do { _ = try AgentWorkspaceCoordinator.shared.acquire(for: workspaceA); preconditionFailure("Duplicate root lease was allowed") }
-        catch { count += 1 }
-        let nestedRoot = a.appending(path: "nested")
-        try FileManager.default.createDirectory(at: nestedRoot, withIntermediateDirectories: true)
-        let nested = WorkspaceModel(rootURL: nestedRoot)
-        defer { nested.close() }
-        do { _ = try AgentWorkspaceCoordinator.shared.acquire(for: nested); preconditionFailure("Nested root lease was allowed") }
-        catch { count += 1 }
-        check(workspaceA.isAgentEditingLocked && !workspaceB.isAgentEditingLocked, "The unrelated root should remain usable")
-        check(workspaceB.buffers[alias]?.textController?.textView.isEditable == false
-              && workspaceB.buffers[protectedFile]?.textController?.textView.isEditable == false,
-              "Acquiring a lease did not protect aliases and external tabs in unrelated windows")
-        check(workspaceB.buffers[otherFile]?.textController?.textView.isEditable == true, "Unrelated files were unnecessarily locked")
-        check(untitled.textController!.textView.shouldChangeText(in: NSRange(location: 0, length: 0), replacementString: "draft"),
-              "An unrelated untitled draft was incorrectly treated as a filesystem target")
-        let newlyOpened = a.appending(path: "new-tab.txt")
-        try Data("new\n".utf8).write(to: newlyOpened)
-        workspaceB.open(newlyOpened)
-        check(workspaceB.activeBuffer?.textController?.textView.isEditable == false, "A tab opened after acquisition bypassed protection")
-        let normal = workspaceB.buffers[otherFile]!
-        check(!workspaceB.save(normal, as: a.appending(path: "save-as.txt")), "Cross-project Save As bypassed the lease")
-        do { try normal.write(to: protectedFile); preconditionFailure("Direct writes bypassed protection") } catch { count += 1 }
-        let aliasBuffer = workspaceB.buffers[alias]!
-        aliasBuffer.textController!.textView.string = "must not save\n"
-        do { try aliasBuffer.save(); preconditionFailure("Symlink save bypassed protection") } catch { count += 1 }
-        workspaceB.activate(alias)
-        workspaceB.saveActive()
-        workspaceB.createItem(named: "created.txt", in: a, isDirectory: false)
-        workspaceB.createItem(named: "../a/traversal.txt", in: b, isDirectory: false)
-        workspaceB.rename(protectedFile, to: "renamed.txt")
-        workspaceB.duplicate(protectedFile)
-        workspaceB.moveToTrash(protectedFile)
-        check(tryContents(protectedFile) == "original\n", "A protected mutation changed or deleted the target")
-        check(!FileManager.default.fileExists(atPath: a.appending(path: "save-as.txt").path)
-              && !FileManager.default.fileExists(atPath: a.appending(path: "created.txt").path)
-              && !FileManager.default.fileExists(atPath: a.appending(path: "traversal.txt").path)
-              && !FileManager.default.fileExists(atPath: a.appending(path: "file copy.txt").path), "A target-path mutation was not guarded")
-        // A link retargeted after the last UI refresh must still be checked at edit/write time.
-        let retargeted = b.appending(path: "retargeted.txt")
-        try FileManager.default.createSymbolicLink(at: retargeted, withDestinationURL: otherFile)
-        workspaceB.open(retargeted)
-        let retargetedBuffer = workspaceB.activeBuffer!
-        try FileManager.default.removeItem(at: retargeted)
-        try FileManager.default.createSymbolicLink(at: retargeted, withDestinationURL: protectedFile)
-        check(retargetedBuffer.textController!.textView.shouldChangeText(in: NSRange(location: 0, length: 0), replacementString: "x") == false,
-              "A stale editable view bypassed a retargeted symlink check")
-        do { try retargetedBuffer.save(); preconditionFailure("Retargeted symlink save bypassed protection") } catch { count += 1 }
-        try Data("agent update\n".utf8).write(to: protectedFile)
-        workspaceA.refresh()
-        check(workspaceA.activeBuffer?.textController?.textView.string == "agent update\n"
-              && workspaceA.activeBuffer?.textController?.textView.isEditable == false,
-              "Protection blocked disk synchronization or made the editor writable afterward")
-        AgentWorkspaceCoordinator.shared.release(lease)
-        check(workspaceB.buffers[alias]?.textController?.textView.isEditable == true, "Releasing a lease did not restore alias editing")
-        try aliasBuffer.save()
-        check(tryContents(protectedFile) == "must not save\n", "Saving did not work after release")
-        check(workspaceB.save(normal, as: a.appending(path: "allowed.txt")), "Save As did not work after release")
+        let project = root.appending(path: "project", directoryHint: .isDirectory)
+        let nested = project.appending(path: "nested", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let file = project.appending(path: "file.txt")
+        try Data("original\n".utf8).write(to: file)
+        let viewer = WorkspaceModel(rootURL: project)
+        defer { viewer.close() }
+        viewer.open(file)
+        let textView = viewer.activeBuffer!.textController!.textView
+        check(!textView.isEditable && textView.isSelectable, "File text must be read-only and selectable")
+        let coordinator = AgentWorkspaceCoordinator.shared
+        let lease = try coordinator.acquire(for: project)
+        let alias = root.appending(path: "alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: project)
+        for overlap in [project, nested, root, alias] {
+            do { _ = try coordinator.acquire(for: overlap); preconditionFailure("Overlapping root acquired a second lease") }
+            catch { count += 1 }
+        }
+        let sibling = root.appending(path: "project-other")
+        let peer = try coordinator.acquire(for: sibling)
+        coordinator.release(peer)
+        check(coordinator.isLocked(project) && !coordinator.isLocked(sibling), "Independent lease release affected another project")
+        textView.setSelectedRange(NSRange(location: 1, length: 2))
+        try Data("original updated\n".utf8).write(to: file)
+        viewer.refresh()
+        check(textView.string == "original updated\n" && textView.selectedRange() == NSRange(location: 1, length: 2),
+              "Disk reload lost the new text or the selection")
+        check(!textView.isEditable && textView.isSelectable, "Disk refresh made a file editable")
+        coordinator.release(lease)
+        check(!coordinator.isLocked(nested) && !textView.isEditable, "Releasing a lease must only enable another task")
+        let next = try coordinator.acquire(for: nested)
+        coordinator.release(next)
+
+        let marker = project.appending(path: "added.txt")
+        try Data().write(to: marker)
+        try Data("watched contents\n".utf8).write(to: file, options: .atomic)
+        try await waitUntil {
+            textView.string == "watched contents\n" && viewer.root.children?.contains { $0.url == marker } == true
+        }
+        check(viewer.activeBuffer?.textController?.textView === textView, "Watcher replaced an open text view")
+        try FileManager.default.removeItem(at: file)
+        viewer.refresh()
+        check(viewer.activeBuffer?.isMissingOnDisk == true && viewer.activeBuffer?.textController == nil,
+              "Deleted file still shows stale source")
+        try Data("restored\n".utf8).write(to: file)
+        viewer.refresh()
+        check(viewer.activeBuffer?.textController?.textView.string == "restored\n", "Recreated file did not reload")
 
         let fixture = CommandLine.arguments[1]
+        viewer.agent.selectAgent(.codex)
+        viewer.agent.executablePath = fixture
+        viewer.agent.draft = "fixture:permission-edit"
+        viewer.agent.send()
+        try await waitUntil { !viewer.agent.permissions.isEmpty }
+        viewer.agent.selectAgent(.claude)
+        check(viewer.agent.kind == .codex, "Busy chat switched agents")
+        let permission = viewer.agent.permissions[0]
+        viewer.agent.answer(permission, option: permission.options[0])
+        try await waitUntil { !viewer.agent.isBusy }
+        check(viewer.agent.turns.first?.editedFiles == ["permission.txt"], "Lost edit path reported only in a permission request")
+        let claudeFixture = root.appending(path: "claude-fixture")
+        try FileManager.default.copyItem(at: URL(filePath: fixture), to: claudeFixture)
+        viewer.agent.draft = "unsent"
+        viewer.agent.selectAgent(.claude)
+        check(!viewer.agent.isConnected && viewer.agent.turns.isEmpty && viewer.agent.draft.isEmpty
+              && viewer.agent.configOptions.isEmpty && viewer.agent.agentVersion.isEmpty, "Switching agents retained Codex chat state")
+        check(viewer.agent.kind == .claude && viewer.agent.executablePath != fixture, "Claude inherited the Codex executable")
+        viewer.agent.executablePath = claudeFixture.path
+        viewer.agent.connect()
+        viewer.agent.selectAgent(.codex)
+        check(viewer.agent.kind == .claude, "Connecting chat switched agents")
+        try await waitUntil { !viewer.agent.isConnecting }
+        let mode = viewer.agent.configOptions.first { $0.category == "mode" }
+        check(viewer.agent.isConnected && mode?.value == "auto" && tryContents(project.appending(path: "selected-mode")) == "auto",
+              "Claude session failed to negotiate auto: \(viewer.agent.errorMessage ?? "no error")")
+        viewer.agent.setConfiguration(mode!, value: "bypassPermissions")
+        check(!viewer.agent.isConnecting && viewer.agent.isConnected, "Requested bypassPermissions")
+        let otherWindow = WorkspaceModel(rootURL: sibling)
+        defer { otherWindow.close() }
+        check(otherWindow.agent.kind == .claude && otherWindow.agent.executablePath == claudeFixture.path, "New window lost saved agent settings")
+        viewer.agent.selectAgent(.codex)
+        check(viewer.agent.executablePath == fixture && !viewer.agent.isConnected && otherWindow.agent.kind == .claude,
+              "Switching back lost the Codex executable or changed another window")
+        await viewer.agent.stopAndDisconnect()
+
         for scenario in ["cancel", "disconnect", "force-disconnect", "wait-after-response", "overflow"] {
             let folder = root.appending(path: scenario)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -110,35 +111,40 @@ struct AgentWorkspaceTests {
             if ["cancel", "force-disconnect", "wait-after-response"].contains(scenario) {
                 try await waitUntil { workspace.agent.turns.first?.items.isEmpty == false
                     && (scenario != "wait-after-response" || workspace.agent.turns.first?.status == "Waiting for command exit") }
-                check(workspace.isAgentEditingLocked, "Running turn did not acquire editing protection")
-                if scenario == "force-disconnect" { await workspace.agent.stopAndDisconnect() }
-                else { workspace.agent.stop() }
+                check(coordinator.isLocked(folder), "Running turn did not acquire the project lease")
+                workspace.agent.stop()
+                if scenario == "force-disconnect" {
+                    try await waitUntil { workspace.agent.canForceDisconnect }
+                    check(coordinator.isLocked(folder), "Stalled cancellation released the lease before End Connection")
+                    workspace.agent.disconnect()
+                }
             }
             var unlockedWhileWriting = false
             try await waitUntil {
                 if let raw = tryContents(folder.appending(path: "writer.pid")), let pid = Int32(raw), isRunning(pid),
-                   !workspace.isAgentEditingLocked { unlockedWhileWriting = true }
+                   !coordinator.isLocked(folder) { unlockedWhileWriting = true }
                 return !workspace.agent.isBusy
             }
             let turn = workspace.agent.turns[0]
-            check(!workspace.isAgentEditingLocked && !turn.hasUnfinishedCommands, "\(scenario): finalization left a lease or hanging tool")
+            check(!coordinator.isLocked(folder) && !turn.hasUnfinishedCommands, "\(scenario): finalization left a lease or hanging tool")
             check(!unlockedWhileWriting, "\(scenario): the lease was released while an owned writer was running")
             if scenario == "overflow" {
                 check(turn.status == "Completed" && turn.omittedToolCount == 1 && turn.timelineNotice?.contains("1 failed") == true,
                       "Hidden terminal completion/failure was lost")
-                check(turn.changes.contains { $0.path == "late.txt" }, "Final snapshot ran before the hidden terminal exited")
+                check(tryContents(folder.appending(path: "late.txt")) == "written before terminal exit\n", "Turn finished before the hidden terminal exited")
+                check(turn.editedFiles == ["edited.txt"], "Turn must list the ACP edit and omit the terminal write")
                 await workspace.agent.stopAndDisconnect()
             } else {
-                let expected = ["disconnect", "force-disconnect"].contains(scenario) ? "interrupted" : "cancelled"
+                let expected = scenario == "disconnect" ? "interrupted" : "cancelled"
                 check(turn.items[0].displayStatus == expected && turn.items[0].exitCode == nil, "\(scenario): tool terminal state is incorrect")
                 let pid = Int32(try String(contentsOf: folder.appending(path: "writer.pid"), encoding: .utf8))!
-                check(!isRunning(pid), "\(scenario): editing was unlocked before the owned writer stopped")
-                let frozen = turn.changes.first { $0.path == "heartbeat" }?.updatedText
+                check(!isRunning(pid), "\(scenario): the lease was released before the owned writer stopped")
+                let frozen = tryContents(folder.appending(path: "heartbeat"))
                 try await Task.sleep(for: .milliseconds(150))
-                check(frozen != nil && frozen == tryContents(folder.appending(path: "heartbeat")), "\(scenario): final snapshot was not stable")
+                check(frozen != nil && frozen == tryContents(folder.appending(path: "heartbeat")), "\(scenario): heartbeat changed after lease release")
             }
         }
-        print("PASS: \(count) real workspace path-protection and AgentSessionModel lifecycle checks")
+        print("PASS: \(count) read-only viewer, workspace lease and AgentSessionModel lifecycle checks")
     }
 
     @MainActor static func waitUntil(_ condition: () -> Bool) async throws {

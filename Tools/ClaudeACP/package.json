@@ -1,0 +1,9 @@
+{
+  "name": "silica-workbench-claude-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned ACP adapter for Silica Workbench development",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.109.0"
+  }
+}

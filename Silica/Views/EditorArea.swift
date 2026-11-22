@@ -15,18 +15,9 @@ struct EditorArea: View {
                 Spacer(minLength: 0)
                 Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sparkles") }
                     .buttonStyle(.borderless)
-                    .help("Show or Hide Codex (⌘R)").accessibilityLabel("Toggle Codex panel")
+                    .help("Show or Hide \(workspace.agent.kind.displayName) (⌘R)").accessibilityLabel("Toggle \(workspace.agent.kind.displayName) panel")
                     .padding(.trailing, 4)
-                if workspace.activeBuffer?.textController != nil {
-                    Button { workspace.reviewActiveFile() } label: {
-                        Image(systemName: "arrow.left.arrow.right")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Review File Changes (⇧⌘D)")
-                    .accessibilityLabel("Review file changes")
-                    .padding(.trailing, 8)
-                }
-                if let buffer = workspace.activeBuffer, buffer.isMarkdown, workspace.fileReview == nil {
+                if let buffer = workspace.activeBuffer, buffer.isMarkdown {
                     MarkdownModeToggle(buffer: buffer)
                         .padding(.trailing, WorkspaceLayout.cardInset + 4)
                 }
@@ -34,13 +25,6 @@ struct EditorArea: View {
             .frame(height: WorkspaceLayout.titleBarHeight)
 
             editorCard
-                .overlay(alignment: .bottomLeading) {
-                    if workspace.isAgentEditingLocked || workspace.activeBuffer.map({ workspace.isEditingLocked($0.url) }) == true {
-                        Text("Codex is working · editing protected")
-                            .font(.caption).padding(8).background(.regularMaterial, in: .rect(cornerRadius: 8))
-                            .padding(8)
-                    }
-                }
                 .padding(.leading, workspace.isSidebarVisible ? 0 : WorkspaceLayout.cardInset)
                 .padding([.trailing, .bottom], WorkspaceLayout.cardInset)
         }
@@ -52,9 +36,7 @@ struct EditorArea: View {
         // the others (under the tab bar) fall back to the minimum.
         let shape = ConcentricRectangle(corners: .concentric(minimum: .fixed(WorkspaceLayout.cardCornerRadius)))
         return Group {
-            if let review = workspace.fileReview {
-                FileReviewView(model: review, workspace: workspace)
-            } else if let buffer = workspace.activeBuffer {
+            if let buffer = workspace.activeBuffer {
                 BufferView(buffer: buffer, workspace: workspace)
             } else {
                 EmptyEditorView(workspace: workspace)
@@ -111,7 +93,6 @@ private struct EditorTabBar: View {
                         EditorTab(
                             url: url,
                             isActive: url == workspace.activeTab,
-                            isDirty: workspace.buffers[url]?.isDirty == true,
                             isMissing: workspace.buffers[url]?.isMissingOnDisk == true,
                             select: { workspace.activate(url) },
                             close: { withAnimation(.snappy) { workspace.closeTab(url) } },
@@ -393,7 +374,6 @@ private enum TabDragEvent {
 private struct EditorTab: View {
     let url: URL
     let isActive: Bool
-    let isDirty: Bool
     /// Deleted or moved on disk since it was opened.
     let isMissing: Bool
     let select: () -> Void
@@ -413,27 +393,18 @@ private struct EditorTab: View {
                 .font(.callout)
                 .lineLimit(1)
                 .strikethrough(isMissing)
-                .help(isMissing ? "Deleted from disk. Save to write it again." : "")
+                .help(isMissing ? "Deleted from disk." : "")
 
-            ZStack {
-                if isDirty && !isHovering {
-                    Circle()
-                        .fill(.primary.opacity(0.7))
-                        .frame(width: 7, height: 7)
-                } else {
-                    Button(action: close) {
-                        Image(systemName: "xmark")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 16, height: 16)
-                            .contentShape(.circle)
-                    }
-                    .buttonStyle(.plain)
-                    .opacity(isActive || isHovering ? 1 : 0)
-                    .help("Close")
-                }
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(.circle)
             }
-            .frame(width: 16, height: 16)
+            .buttonStyle(.plain)
+            .opacity(isActive || isHovering ? 1 : 0)
+            .help("Close")
         }
         .padding(.leading, 10)
         .padding(.trailing, 6)
@@ -459,11 +430,9 @@ private struct EditorTab: View {
         .contextMenu {
             Button("Close", action: close)
             Button("Close Others", action: closeOthers)
-            if !url.isUntitled {
-                Divider()
-                Button("Show in Finder") { Finder.reveal(url) }
-                Button("Copy Path") { Finder.copyPath(url) }
-            }
+            Divider()
+            Button("Show in Finder") { Finder.reveal(url) }
+            Button("Copy Path") { Finder.copyPath(url) }
         }
     }
 }
@@ -650,7 +619,7 @@ private struct EmptyEditorView: View {
             VStack(spacing: 6) {
                 Text(workspace.name)
                     .font(.title2.weight(.semibold))
-                Text("Select a file in the sidebar to start editing.")
+                Text("Select a file in the sidebar to read it.")
                     .foregroundStyle(.secondary)
             }
 

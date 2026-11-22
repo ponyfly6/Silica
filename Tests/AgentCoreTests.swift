@@ -102,50 +102,97 @@ struct AgentCoreTests {
         let root = FileManager.default.temporaryDirectory.appending(path: "silica-agent-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        func write(_ path: String, _ text: String) throws { try Data(text.utf8).write(to: root.appending(path: path)) }
-        try write("old.txt", "before\n")
-        try write("dirty.txt", "pre-existing user edit\n")
-        try write("delete.txt", "remove me\n")
-        try write(".gitignore", "*.ignored\n")
-        try write("skip.ignored", "ignored\n")
-        let nonGit = try TurnSnapshot.capture(root: root)
-        check(Set(nonGit.entries.keys) == ["old.txt", "dirty.txt", "delete.txt", ".gitignore"], "Non-Git discovery: \(nonGit.entries.keys.sorted())")
-        let git = Process()
-        git.executableURL = URL(filePath: "/usr/bin/git"); git.currentDirectoryURL = root
-        git.arguments = ["init", "-q"]; try git.run(); git.waitUntilExit()
-        let add = Process()
-        add.executableURL = git.executableURL; add.currentDirectoryURL = root
-        add.arguments = ["add", "old.txt", "dirty.txt", "delete.txt", ".gitignore"]
-        try add.run(); add.waitUntilExit()
-        // A tracked file remains eligible after a new ignore rule matches it.
-        try write(".gitignore", "*.ignored\nold.txt\n")
-        let before = try TurnSnapshot.capture(root: root)
-        check(before.entries["old.txt"]?.text == "before\n", "Tracked ignored file was lost")
-        check(before.entries["skip.ignored"] == nil, "Ignored untracked file was captured")
-        try write("old.txt", "after\n")
-        try write("new.txt", "new file\n")
-        try FileManager.default.removeItem(at: root.appending(path: "delete.txt"))
-        let after = try TurnSnapshot.capture(root: root, including: Set(before.entries.keys))
-        let changes = after.changes(comparedTo: before)
-        check(Set(changes.map(\.path)) == ["old.txt", "new.txt", "delete.txt"], "Turn changes included an existing edit or missed a new/deleted file")
-        check(changes.first { $0.path == "delete.txt" }?.kind == .deleted, "Deleted file kind is wrong")
-        check(changes.first { $0.path == "new.txt" }?.originalText == "", "New file requires an empty original")
-        try write("old.txt", "later edit\n")
-        check(changes.first { $0.path == "old.txt" }?.updatedText == "after\n", "A later edit changed the frozen review")
-        let limited = try TurnSnapshot.capture(root: root, byteBudget: 0)
-        check(limited.storedBytes == 0 && !limited.warnings.isEmpty, "Snapshot limits were silent")
-        check(AgentPaths.overlaps(root, root.appending(path: "nested")), "Nested roots must share a lease")
-        check(!AgentPaths.overlaps(root, URL(filePath: root.path + "-sibling")), "Path prefixes are not ancestry")
-        check(AgentPaths.safeURL("../escape", root: root) == nil, "Accepted parent traversal")
-        try FileManager.default.createSymbolicLink(at: root.appending(path: "outside"), withDestinationURL: URL(filePath: "/etc/hosts"))
-        let links = try TurnSnapshot.capture(root: root)
-        check(links.entries["outside"]?.bytes == nil, "Read an external symlink target")
+        let decisions: [(AgentKind, [String], String?, AgentKind.ModeDecision)] = [
+            (.codex, [], nil, .keep),
+            (.claude, [], nil, .fail),
+            (.codex, ["workspace-write", "read-only"], "read-only", .keep),
+            (.codex, ["read-only", "workspace-write"], "workspace-write", .keep),
+            (.codex, ["bypassPermissions", "workspace-write"], "danger-full-access", .switchTo("workspace-write")),
+            (.codex, ["read-only", "bypassPermissions"], "danger-full-access", .fail),
+            (.claude, ["default", "acceptEdits", "auto"], "bypassPermissions", .switchTo("auto")),
+            (.claude, ["default", "acceptEdits"], "bypassPermissions", .switchTo("acceptEdits")),
+            (.claude, ["plan", "default"], "unknown", .switchTo("default")),
+            (.claude, ["plan", "dontAsk", "bypassPermissions"], "bypassPermissions", .fail)
+        ]
+        for (kind, offered, current, expected) in decisions {
+            check(kind.modeDecision(offered: offered, current: current) == expected, "\(kind) mode policy for \(current ?? "unspecified"), \(offered)")
+        }
+        for mode in ["auto", "default", "acceptEdits", "plan", "dontAsk"] {
+            check(AgentKind.claude.modeDecision(offered: [mode, "auto"], current: mode) == .keep, "Replaced allowed Claude mode \(mode)")
+        }
+
+        let support = root.appending(path: "support"), checkout = root.appending(path: "checkout"), bin = root.appending(path: "bin")
+        for (kind, directory, name) in [(AgentKind.codex, "CodexACP", "codex-acp"), (.claude, "ClaudeACP", "claude-agent-acp")] {
+            func find(_ path: String = "") -> URL? {
+                kind.find(configuredPath: path, supportDirectory: support, checkoutFrom: checkout.appending(path: "build"), binDirectories: [bin])
+            }
+            let relative = "\(directory)/node_modules/.bin/\(name)"
+            for candidate in [bin.appending(path: name), checkout.appending(path: "Tools/\(relative)"), support.appending(path: relative)] {
+                try FileManager.default.createDirectory(at: candidate.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.createSymbolicLink(at: candidate, withDestinationURL: fixture)
+                check(find()?.standardizedFileURL == candidate.standardizedFileURL, "Wrong discovery precedence for \(name)")
+            }
+            check(find(fixture.path)?.standardizedFileURL == fixture.standardizedFileURL && find(root.path) == nil && find(root.appending(path: "missing").path) == nil,
+                  "Explicit \(name) path should be authoritative and executable")
+        }
+
+        let claude = AgentTurn(number: 1, prompt: "Claude fixture")
+        let path = root.appending(path: "main.swift").path
+        claude.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("toolu_edit"), "kind": .string("edit"),
+            "locations": .array([.object(["path": .string(path), "line": .number(1)])])]), projectRoot: root)
+        claude.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("toolu_edit"), "status": .string("completed"),
+            "content": .array([.object(["type": .string("diff"), "path": .string(path), "oldText": .string("old"), "newText": .string("new")])])]), projectRoot: root)
+        check(claude.editedFiles == ["main.swift"], "Claude edit locations and diff paths should yield one project file")
+        claude.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("toolu_bash"), "kind": .string("execute"),
+            "title": .string("Bash"), "rawInput": .object(["command": .string("pwd")])]))
+        claude.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("toolu_bash"), "status": .string("completed"),
+            "content": .array([.object(["type": .string("content"), "content": .object(["type": .string("text"), "text": .string(root.path)])])])]))
+        check(claude.items.last?.displayOutput == root.path && claude.items.last?.exitCode == nil && !claude.hasUnfinishedCommands,
+              "Claude shell output should be visible and complete without a terminal exit")
+
+        // Claude ACP 0.109.0 with the terminal-output extension. Both output reports describe the same bytes.
+        let bashEvents = [
+            #"{"sessionUpdate":"tool_call","toolCallId":"bash","kind":"execute","status":"pending","content":[{"type":"terminal","terminalId":"t"}],"_meta":{"claudeCode":{"toolName":"Bash"},"terminal_info":{"terminal_id":"t"}}}"#,
+            #"{"sessionUpdate":"tool_call_update","toolCallId":"bash","_meta":{"claudeCode":{"toolName":"Bash","toolResponse":{"stdout":"alpha\nadded\nOK","stderr":""}}}}"#,
+            #"{"sessionUpdate":"tool_call_update","toolCallId":"bash","_meta":{"terminal_output_delta":{"terminal_id":"t","data":"alpha\nadded\nOK"}}}"#,
+            #"{"sessionUpdate":"tool_call_update","toolCallId":"bash","status":"completed","_meta":{"terminal_exit":{"terminal_id":"t","exit_code":0,"signal":null}}}"#
+        ]
+        for event in bashEvents.dropLast() { claude.apply(try JSONDecoder().decode(ACPJSON.self, from: Data(event.utf8))) }
+        check(claude.items.last?.displayOutput == "alpha\nadded\nOK" && claude.items.last?.exitCode == nil && claude.hasUnfinishedCommands,
+              "Claude display terminal must show one copy of stdout and wait for the reported exit")
+        claude.apply(try JSONDecoder().decode(ACPJSON.self, from: Data(bashEvents.last!.utf8)))
+        check(claude.items.last?.displayOutput == "alpha\nadded\nOK" && claude.items.last?.exitCode == 0 && !claude.hasUnfinishedCommands,
+              "Claude terminal exit must settle its tool and preserve the output")
+
+        func editEvent(_ event: String, _ id: String, _ kind: String?, locations: [String] = [], diffs: [String] = []) {
+            var fields: [String: ACPJSON] = [
+                "sessionUpdate": .string(event), "toolCallId": .string(id),
+                "locations": .array(locations.map { .object(["path": .string($0)]) }),
+                "content": .array(diffs.map { .object(["type": .string("diff"), "path": .string($0)]) }
+                    + [.object(["type": .string("content"), "path": .string("irrelevant")])])
+            ]
+            fields["kind"] = kind.map(ACPJSON.string)
+            turn.apply(.object(fields), projectRoot: root)
+        }
+        let outside = root.deletingLastPathComponent()
+        try FileManager.default.createSymbolicLink(at: root.appending(path: "outside"), withDestinationURL: outside)
+        editEvent("tool_call", "patch", "edit", locations: ["one", root.appending(path: "one").path],
+                  diffs: ["two", "../escape", outside.appending(path: "escape").path, "outside/missing"])
+        editEvent("tool_call_update", "patch", nil, diffs: ["three", "one"])
+        editEvent("tool_call_update", "delete", "delete", diffs: ["deleted"])
+        editEvent("tool_call", "rename", "move", locations: ["old", "new"])
+        for kind in ["read", "execute"] { editEvent("tool_call", kind, kind, locations: ["ignored"], diffs: ["ignored"]) }
+        check(turn.editedFiles == ["one", "two", "three", "deleted", "old", "new"],
+              "Incorrect project-relative edited files or order: \(turn.editedFiles)")
+        editEvent("tool_call_update", "patch", nil, locations: (0..<501).map { "file-\($0)" })
+        check(turn.editedFiles.count == 500 && turn.editedFiles.last == "file-493" && turn.editedFilesTruncated,
+              "Edited file cap did not preserve the first 500 paths")
 
         let transport = ACPTransport()
         var sequence: [Int] = []
         transport.onNotification = { _, params in if let value = params["sequence"].integer { sequence.append(value) } }
         transport.onRequest = { _, id, _ in transport.respond(id: id, result: .object(["outcome": .string("fixture-selected")])) }
-        try await transport.start(executable: fixture, cwd: root)
+        try await transport.start(executable: fixture, cwd: root, kind: .codex)
         let echo = try await transport.request("echo", params: .object(["text": .string("roundtrip 🐱")]))
         check(echo["text"].string == "roundtrip 🐱", "RPC response was not matched to its request")
         _ = try await transport.request("notify", params: .object([:]))
@@ -165,7 +212,7 @@ struct AgentCoreTests {
         for method in ["spawn-writer", "orphan", "spawn-on-eof", "block-stdin"] {
             let processTransport = ACPTransport()
             let heartbeat = root.appending(path: "\(method).heartbeat")
-            try await processTransport.start(executable: processFixture, cwd: root)
+            try await processTransport.start(executable: processFixture, cwd: root, kind: .codex)
             let result = try await processTransport.request(method, params: .object(["path": .string(heartbeat.path)]))
             var pid = result["pid"].integer.map { Int32($0) }
             defer { if let pid, isRunning(pid) { kill(pid, SIGKILL) } }
@@ -186,7 +233,7 @@ struct AgentCoreTests {
             let later = try Data(contentsOf: heartbeat)
             check(frozen == later, "\(method): a child continued writing after shutdown returned")
         }
-        print("PASS: \(count) ACP framing, ordered dispatch, RPC, tool events, cancellation boundaries and per-turn snapshot checks")
+        print("PASS: \(count) agent discovery, mode policy, ACP framing, ordered dispatch, RPC, tool events, process cleanup and edited-file checks")
     }
 
     nonisolated static func isRunning(_ pid: Int32) -> Bool {

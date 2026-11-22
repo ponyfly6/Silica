@@ -8,6 +8,7 @@ final class ACPTransport {
     var onRequest: ((String, ACPJSON, ACPJSON) -> Void)?
     var onDisconnect: ((String) -> Void)?
 
+    private var kind: AgentKind = .codex
     private var process: Process?
     private var processTree: AgentProcessTree?
     private var cleanup: Task<AgentShutdownResult, Never>?
@@ -22,28 +23,29 @@ final class ACPTransport {
     private var generation = UUID()
     private(set) var isConnected = false
 
-    func start(executable: URL, cwd: URL) async throws {
+    func start(executable: URL, cwd: URL, kind: AgentKind) async throws {
         let previous = await shutdown()
-        guard previous.isComplete else { throw ACPError.message("Previous Codex processes are still stopping. Reconnect after they exit.") }
+        guard previous.isComplete else { throw ACPError.message("Previous \(self.kind.displayName) processes are still stopping. Reconnect after they exit.") }
         try Task.checkCancellation()
+        self.kind = kind
         let generation = UUID()
         self.generation = generation
         let stream = AsyncThrowingStream<ACPJSON, Error>.makeStream(bufferingPolicy: .bufferingOldest(512))
         continuation = stream.continuation
-        let reader = ACPStreamReader(continuation: stream.continuation)
+        let reader = ACPStreamReader(continuation: stream.continuation, kind: kind)
         let process = Process()
         let incoming = Pipe(), outgoing = Pipe(), errors = Pipe()
         // A child can exit while the serial writer is blocked in write(2).
         // Report EPIPE through the request path instead of terminating the app.
         guard fcntl(outgoing.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
-            throw ACPError.message("Could not configure the Codex input pipe.")
+            throw ACPError.message("Could not configure the \(kind.displayName) input pipe.")
         }
         process.executableURL = executable
         process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (environment["PATH"] ?? "")
-        environment["INITIAL_AGENT_MODE"] = "workspace-write"
-        // Reuse Codex's own account/config. Never persist or log credentials here.
+        environment["INITIAL_AGENT_MODE"] = kind.launchMode
+        // Reuse the agent's own account/config. Never persist or log credentials here.
         process.environment = environment
         process.standardInput = outgoing
         process.standardOutput = incoming
@@ -59,7 +61,7 @@ final class ACPTransport {
         stderr = errors.fileHandleForReading
         do {
             try process.run()
-            processTree = try AgentProcessTree(pid: process.processIdentifier)
+            processTree = try AgentProcessTree(pid: process.processIdentifier, kind: kind)
         } catch {
             if process.isRunning { process.terminate(); kill(process.processIdentifier, SIGKILL) }
             close(); throw error
@@ -71,7 +73,7 @@ final class ACPTransport {
                     guard let self, self.generation == generation, !Task.isCancelled else { return }
                     self.receive(message)
                 }
-                throw ACPError.message("Codex disconnected. Existing output and file changes are preserved.")
+                throw ACPError.message("\(kind.displayName) disconnected. Existing output and file changes are preserved.")
             } catch {
                 guard let self, self.generation == generation, self.isConnected else { return }
                 self.failPending(error)
@@ -88,14 +90,14 @@ final class ACPTransport {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 guard isConnected else {
-                    continuation.resume(throwing: ACPError.message("Connect Codex before sending a request."))
+                    continuation.resume(throwing: ACPError.message("Connect \(kind.displayName) before sending a request."))
                     return
                 }
                 pending[key] = continuation
                 if let timeout {
-                    timeouts[key] = Task { [weak self] in
+                    timeouts[key] = Task { [weak self, kind] in
                         do { try await Task.sleep(for: timeout) } catch { return }
-                        self?.resolve(key, result: .failure(ACPError.message("Codex did not answer \(method) in time.")))
+                        self?.resolve(key, result: .failure(ACPError.message("\(kind.displayName) did not answer \(method) in time.")))
                     }
                 }
                 send(.object(["jsonrpc": .string("2.0"), "id": id, "method": .string(method), "params": params]))
@@ -131,7 +133,7 @@ final class ACPTransport {
                         guard let self, self.generation == generation else { return }
                         self.failPending(error)
                         self.close()
-                        self.onDisconnect?("Could not write to Codex. Reconnect to continue.")
+                        self.onDisconnect?("Could not write to \(self.kind.displayName). Reconnect to continue.")
                     }
                 }
             }
@@ -165,7 +167,7 @@ final class ACPTransport {
     func close() {
         isConnected = false
         generation = UUID()
-        failPending(ACPError.message("The Codex connection was closed."))
+        failPending(ACPError.message("The \(kind.displayName) connection was closed."))
         consumer?.cancel(); consumer = nil
         continuation?.finish(); continuation = nil
         let process = process
@@ -227,7 +229,11 @@ nonisolated private final class ACPStreamReader: @unchecked Sendable {
     private var ended = false
     private let continuation: AsyncThrowingStream<ACPJSON, Error>.Continuation
 
-    init(continuation: AsyncThrowingStream<ACPJSON, Error>.Continuation) { self.continuation = continuation }
+    private let kind: AgentKind
+
+    init(continuation: AsyncThrowingStream<ACPJSON, Error>.Continuation, kind: AgentKind) {
+        self.continuation = continuation; self.kind = kind
+    }
 
     func receive(_ data: Data) {
         lock.lock(); defer { lock.unlock() }
@@ -236,7 +242,7 @@ nonisolated private final class ACPStreamReader: @unchecked Sendable {
             if data.isEmpty { try decoder.finish(); ended = true; continuation.finish(); return }
             for message in try decoder.append(data) {
                 if case .dropped = continuation.yield(message) {
-                    throw ACPError.message("Codex output exceeded the protocol queue limit. Partial output was preserved.")
+                    throw ACPError.message("\(kind.displayName) output exceeded the protocol queue limit. Partial output was preserved.")
                 }
             }
         } catch { ended = true; continuation.finish(throwing: error) }

@@ -46,8 +46,6 @@ final class ProjectSearchModel {
     /// Bumped to put the cursor in the search field.
     var focusRequest = 0
 
-    /// The current text of edited files, searched instead of what's on disk.
-    @ObservationIgnored var unsavedTexts: () -> [URL: String] = { [:] }
     @ObservationIgnored private var task: Task<Void, Never>?
 
     init(rootURL: URL) {
@@ -73,12 +71,11 @@ final class ProjectSearchModel {
         isSearching = true
         let root = rootURL
         let caseSensitive = isCaseSensitive
-        let overrides = unsavedTexts()
         task = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
             let outcome = await Task.detached(priority: .userInitiated) {
-                ProjectSearch.run(root: root, query: query, caseSensitive: caseSensitive, overrides: overrides)
+                ProjectSearch.run(root: root, query: query, caseSensitive: caseSensitive)
             }.value
             guard let self, !Task.isCancelled else { return }
             self.results = outcome.files
@@ -104,12 +101,12 @@ nonisolated enum ProjectSearch {
         var isTruncated = false
     }
 
-    static func run(root: URL, query: String, caseSensitive: Bool, overrides: [URL: String]) -> Outcome {
+    static func run(root: URL, query: String, caseSensitive: Bool) -> Outcome {
         var outcome = Outcome()
         let options: NSString.CompareOptions = caseSensitive ? [.literal] : [.caseInsensitive]
         for item in ProjectFileIndex.scan(root: root) {
             if Task.isCancelled { return Outcome() }
-            guard let text = overrides[item.url] ?? readText(item.url) else { continue }
+            guard let text = readText(item.url) else { continue }
             let matches = search(text as NSString, for: query, options: options, file: item.url,
                                  limit: maxMatches - outcome.matchCount)
             guard !matches.isEmpty else { continue }

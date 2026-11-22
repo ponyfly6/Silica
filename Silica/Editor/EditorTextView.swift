@@ -22,15 +22,7 @@ final class EditorTextView: NSTextView {
         var usesTabs: Bool
         /// Columns per level: 2, 4 or 8, or the tab width for tabs.
         var width: Int
-
-        /// The text one level of indentation inserts.
-        var unitString: String { usesTabs ? "\t" : String(repeating: " ", count: width) }
     }
-
-    /// The language being edited, for comment markers and block-opening `:`.
-    var language: SyntaxLanguage?
-    /// Inserted by Return; matches the file (`\n` or `\r\n`).
-    var lineEnding = "\n"
 
     private var cachedIndentation: Indentation?
 
@@ -41,16 +33,8 @@ final class EditorTextView: NSTextView {
         return detected
     }
 
-    /// Detects the indentation again; it's otherwise kept from when the file opened,
-    /// as in VS Code, so editing doesn't flip it.
     func redetectIndentation() {
         cachedIndentation = nil
-    }
-
-    override func didChangeText() {
-        super.didChangeText()
-        // Guides follow the text, so any edit can move them.
-        setNeedsDisplay(visibleRect)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -201,16 +185,64 @@ final class EditorTextView: NSTextView {
             lineStart = NSMaxRange(text.lineRange(for: NSRange(location: lineStart, length: 0)))
             lines += 1
         }
-        let settings = EditorSettings.shared
-        // Nothing indented yet (a new file): the style from Settings.
         if tabLines == 0 && spaceLines == 0 {
-            return Indentation(usesTabs: settings.indentsWithTabs, width: settings.tabWidth)
+            return Indentation(usesTabs: false, width: tabWidth)
         }
         if tabLines > spaceLines {
             return Indentation(usesTabs: true, width: tabWidth)
         }
         let width = [2, 4, 8].max { steps[$0, default: 0] < steps[$1, default: 0] }
-            .flatMap { steps[$0, default: 0] > 0 ? $0 : nil } ?? settings.tabWidth
+            .flatMap { steps[$0, default: 0] > 0 ? $0 : nil } ?? tabWidth
         return Indentation(usesTabs: false, width: width)
+    }
+
+    // MARK: Navigation
+
+    /// Columns from the start of the line to `offset`, with tabs expanded.
+    func visualColumn(at offset: Int) -> Int {
+        let text = string as NSString
+        let lineStart = text.lineRange(for: NSRange(location: min(offset, text.length), length: 0)).location
+        var column = 0
+        for index in lineStart..<min(offset, text.length) {
+            column += text.character(at: index) == 0x09 ? Self.tabWidth - column % Self.tabWidth : 1
+        }
+        return column
+    }
+
+    /// Puts the cursor at `location` and scrolls it to the middle of the view.
+    func placeCursor(at location: Int) {
+        setSelectedRange(NSRange(location: min(location, (string as NSString).length), length: 0))
+        centerSelection()
+    }
+
+    /// Selects `range` and scrolls it into the middle of the view, with the find bounce.
+    func reveal(_ range: NSRange) {
+        let length = (string as NSString).length
+        let clamped = NSRange(location: min(range.location, length), length: min(range.length, max(0, length - range.location)))
+        setSelectedRange(clamped)
+        centerSelection()
+        if clamped.length > 0 { showFindIndicator(for: clamped) }
+    }
+
+    private func centerSelection() {
+        guard let layoutManager = textLayoutManager,
+              let contentManager = layoutManager.textContentManager,
+              let scrollView = enclosingScrollView,
+              let location = contentManager.location(layoutManager.documentRange.location, offsetBy: selectedRange().location),
+              let range = NSTextRange(location: layoutManager.documentRange.location, end: location) else {
+            scrollRangeToVisible(selectedRange())
+            return
+        }
+        layoutManager.ensureLayout(for: range)
+        guard let fragment = layoutManager.textLayoutFragment(for: location) else {
+            scrollRangeToVisible(selectedRange())
+            return
+        }
+        let visibleHeight = scrollView.contentView.bounds.height
+        let y = fragment.layoutFragmentFrame.midY + textContainerOrigin.y - visibleHeight / 2
+        let maxY = max(0, frame.height - visibleHeight)
+        scroll(NSPoint(x: 0, y: min(max(0, y), maxY)))
+        // Sideways too, for long lines when wrapping is off.
+        scrollRangeToVisible(selectedRange())
     }
 }

@@ -11,14 +11,19 @@ struct AgentPanelView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "sparkle")
-                Text("Codex").font(.headline)
+                Picker("Agent", selection: Binding(get: { model.kind }, set: model.selectAgent)) {
+                    ForEach(AgentKind.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                }
+                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
+                .disabled(model.isBusy || model.isConnecting || !model.survivingProcessIDs.isEmpty)
+                .help("Switch agents and start a new chat in this window")
                 Spacer(minLength: 0)
                 Button { model.newChat() } label: { Image(systemName: "square.and.pencil") }
                     .disabled(model.isBusy || model.isConnecting)
-                    .help("New chat · clears this window’s in-memory conversation and review snapshots")
-                    .accessibilityLabel("New Codex chat")
+                    .help("New chat · clears this window’s in-memory conversation")
+                    .accessibilityLabel("New \(model.kind.displayName) chat")
                 Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sidebar.right") }
-                    .help("Hide Codex (⌘R)").accessibilityLabel("Hide Codex panel")
+                    .help("Hide \(model.kind.displayName) (⌘R)").accessibilityLabel("Hide \(model.kind.displayName) panel")
             }
             .buttonStyle(.borderless).foregroundStyle(.secondary)
             .frame(height: WorkspaceLayout.titleBarHeight).padding(.horizontal, 12)
@@ -67,19 +72,19 @@ struct AgentPanelView: View {
                     .disabled(model.isConnecting).controlSize(.small)
                 }
                 Button { showsConnection.toggle() } label: { Image(systemName: "gearshape") }
-                    .buttonStyle(.borderless).help("Connection settings").accessibilityLabel("Codex connection settings")
+                    .buttonStyle(.borderless).help("Connection settings").accessibilityLabel("\(model.kind.displayName) connection settings")
             }
             if showsConnection {
-                TextField("codex-acp executable (auto-detect)", text: $model.executablePath)
+                TextField("\(model.kind.executableName) executable (auto-detect)", text: $model.executablePath)
                     .textFieldStyle(.roundedBorder).disabled(model.isConnected || model.isBusy || model.isConnecting)
-                Text("Uses your existing Codex login. Adapter \(model.agentVersion.isEmpty ? "not connected" : model.agentVersion).")
+                Text("Uses your existing \(model.kind.displayName) login. Adapter \(model.agentVersion.isEmpty ? "not connected" : model.agentVersion).")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("If your login expires, run codex login in Terminal, then reconnect.")
+                Text(model.kind.loginHint)
                     .font(.caption).foregroundStyle(.secondary)
             }
             ForEach(model.configOptions.filter { ["mode", "model", "thought_level"].contains($0.category) }) { option in
                 Picker(option.name, selection: Binding(get: { option.value }, set: { model.setConfiguration(option, value: $0) })) {
-                    ForEach(option.choices.filter { option.category != "mode" || ["workspace-write", "read-only"].contains($0.id) }) { choice in
+                    ForEach(option.choices.filter { option.category != "mode" || model.kind.allowedModes.contains($0.id) }) { choice in
                         Text(choice.name).tag(choice.id)
                     }
                 }
@@ -95,9 +100,9 @@ struct AgentPanelView: View {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     if model.turns.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Work on this project with Codex").font(.headline)
-                            Text("Ask a question or describe a change. Each task captures a baseline so you can review its files afterward.")
-                            Text("Chat and review history stay in this window until it is closed or you start a new chat.")
+                            Text("Work on this project with \(model.kind.displayName)").font(.headline)
+                            Text("Ask a question or describe a change. Select a file below a turn to read it.")
+                            Text("Chat history stays in this window until it is closed or you start a new chat.")
                         }
                         .font(.callout).foregroundStyle(.secondary).padding(.top, 18)
                     }
@@ -116,7 +121,7 @@ struct AgentPanelView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Message Codex").font(.caption).foregroundStyle(.secondary)
+            Text("Message \(model.kind.displayName)").font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $model.draft)
                 .focused($isComposerFocused)
                 .task {
@@ -128,10 +133,8 @@ struct AgentPanelView: View {
                 .font(.body).scrollContentBackground(.hidden)
                 .frame(minHeight: 60, idealHeight: 80, maxHeight: 120)
                 .padding(5).background(.primary.opacity(0.04), in: .rect(cornerRadius: 8))
-                .accessibilityLabel("Message Codex")
+                .accessibilityLabel("Message \(model.kind.displayName)")
             HStack {
-                Text(model.isBusy ? "Project editing is protected" : "Snapshots cover non-ignored project files")
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                 Spacer(minLength: 0)
                 if !model.survivingProcessIDs.isEmpty {
                     Button("Release Project…", role: .destructive) { confirmsRelease = true }.controlSize(.small)
@@ -147,11 +150,11 @@ struct AgentPanelView: View {
             }
         }
         .padding(10)
-        .alert("Release the project while Codex processes are still running?", isPresented: $confirmsRelease) {
+        .alert("Release the project while \(model.kind.displayName) processes are still running?", isPresented: $confirmsRelease) {
             Button("Release Project", role: .destructive) { Task { await model.releaseSurvivingProcesses() } }
             Button("Keep Waiting", role: .cancel) {}
         } message: {
-            Text("Processes \(model.survivingProcessIDs.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files. Silica stops protecting the project and marks this turn’s review as provisional. Check them in Activity Monitor.")
+            Text("Processes \(model.survivingProcessIDs.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files. Releasing the project allows another task to start. Check them in Activity Monitor.")
         }
     }
 
@@ -206,33 +209,22 @@ private struct AgentTurnView: View {
                     AgentToolView(item: item)
                 }
             }
-            if let failure = turn.reviewFailure {
-                Text(failure).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-            }
-            if turn.endedAt != nil {
+            if !turn.editedFiles.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Observed this turn · \(turn.changes.count) \(turn.changes.count == 1 ? "file" : "files")").font(.caption).foregroundStyle(.secondary)
-                    ForEach(turn.changes) { change in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Button { workspace.reviewAgentChange(change, turn: turn) } label: {
-                                HStack {
-                                    Text(change.path).lineLimit(2).truncationMode(.middle)
-                                    Spacer(minLength: 4)
-                                    Text(change.kind.rawValue).foregroundStyle(.secondary)
-                                }.font(.caption).contentShape(.rect)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(change.originalText == nil || change.updatedText == nil)
-                            .help(change.path)
-                            if let note = change.note { Text(note).font(.caption2).foregroundStyle(.secondary) }
+                    Text("Edited by agent · \(turn.editedFiles.count) \(turn.editedFiles.count == 1 ? "file" : "files")")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(turn.editedFiles, id: \.self) { path in
+                        Button(path) {
+                            let url = workspace.rootURL.appending(path: path)
+                            workspace.open(url)
+                            workspace.reveal(url)
                         }
+                        .buttonStyle(.link).font(.caption).lineLimit(2).truncationMode(.middle).help(path)
                     }
-                    if !turn.warnings.isEmpty {
-                        DisclosureGroup("Capture limitations (\(turn.warnings.count))") {
-                            Text(turn.warnings.joined(separator: "\n")).font(.caption2).textSelection(.enabled)
-                        }.font(.caption)
+                    if turn.editedFilesTruncated {
+                        Text("Showing the first 500 files.").font(.caption2).foregroundStyle(.secondary)
                     }
-                    Text("Ignored files and external symlinks are excluded. Text capture is limited to 1 MiB per file. External edits during a task may also appear here.")
+                    Text("Changes made through shell commands are not listed.")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
@@ -253,9 +245,8 @@ private struct AgentToolView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(item.title).textSelection(.enabled)
                 if !item.cwd.isEmpty { Text(item.cwd).foregroundStyle(.secondary).textSelection(.enabled) }
-                let output = item.output.isEmpty ? item.contentText : item.output
-                if !output.isEmpty {
-                    ScrollView([.horizontal, .vertical]) { Text(output).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                if !item.displayOutput.isEmpty {
+                    ScrollView([.horizontal, .vertical]) { Text(item.displayOutput).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                         .frame(maxHeight: 180)
                 }
                 if item.outputTruncated { Text("Output truncated at 1 MiB").foregroundStyle(.secondary) }

@@ -93,14 +93,8 @@ struct FileTreeView: View {
                     // A flat list of the visible nodes, each indented by its depth, so the
                     // rows can draw their own compact disclosure chevrons.
                     ForEach(rows) { row in
-                        switch row.kind {
-                        case .node(let node):
-                            FileNodeRow(node: node, depth: row.depth, workspace: workspace)
-                                .id(node.url)
-                        case .draft(let folder, let isDirectory):
-                            NewItemRow(folder: folder, isDirectory: isDirectory, depth: row.depth, workspace: workspace)
-                                .selectionDisabled()
-                        }
+                        FileNodeRow(node: row.node, depth: row.depth, workspace: workspace)
+                            .id(row.id)
                     }
                 }
                 // Room to scroll the last rows up from under the filter field
@@ -117,22 +111,6 @@ struct FileTreeView: View {
             // ← / → collapse and expand folders, as the system outline did.
             .onKeyPress(.rightArrow) { workspace.setSelectedFolderExpanded(true) ? .handled : .ignored }
             .onKeyPress(.leftArrow) { workspace.setSelectedFolderExpanded(false) ? .handled : .ignored }
-            // Return renames and ⌘⌫ moves to the Trash, as in Finder.
-            .onKeyPress(.return) {
-                guard workspace.treeEdit == nil, let selection = workspace.selection else { return .ignored }
-                workspace.beginRename(selection)
-                return .handled
-            }
-            .onKeyPress(.delete, phases: .down) { press in
-                guard press.modifiers == .command, workspace.treeEdit == nil,
-                      let selection = workspace.selection else { return .ignored }
-                workspace.moveToTrash(selection)
-                return .handled
-            }
-            .contextMenu {
-                Button("New File…") { workspace.beginNewItem(isDirectory: false, in: workspace.rootURL) }
-                Button("New Folder…") { workspace.beginNewItem(isDirectory: true, in: workspace.rootURL) }
-            }
             // Compact, editor-style rows.
             .environment(\.sidebarRowSize, .small)
             .environment(\.defaultMinListRowHeight, 22)
@@ -177,13 +155,7 @@ struct FileTreeView: View {
     }
 
     fileprivate struct TreeRow: Identifiable {
-        enum Kind {
-            case node(FileNode)
-            /// The name field for a new file or folder.
-            case draft(folder: URL, isDirectory: Bool)
-        }
-
-        let kind: Kind
+        let node: FileNode
         let depth: Int
         /// A folder shown with its contents.
         var isOpenFolder = false
@@ -192,47 +164,26 @@ struct FileTreeView: View {
             PinnedFolderTracker.Row(depth: depth, isOpenFolder: isOpenFolder)
         }
 
-        var id: String {
-            switch kind {
-            case .node(let node): node.url.absoluteString
-            case .draft: "silica-new-item"
-            }
-        }
-
-        /// The file or folder the row shows.
-        var url: URL? {
-            if case .node(let node) = kind { node.url } else { nil }
-        }
+        var id: URL { node.url }
     }
 
     private func visibleRows() -> [TreeRow] {
         var rows: [TreeRow] = []
-        var draftFolder: URL?
-        var draftIsDirectory = false
-        if case .create(let folder, let isDirectory) = workspace.treeEdit {
-            draftFolder = folder
-            draftIsDirectory = isDirectory
-        }
-
         // While filtering: only matches and the folders above them, all open.
         let filtered = workspace.isFilteringTree ? workspace.treeFilterResult?.visiblePaths : nil
         if workspace.isFilteringTree && filtered == nil { return [] }
 
-        func add(_ nodes: [FileNode], depth: Int, in folder: URL) {
-            // A new item's name field goes first in its folder.
-            if folder == draftFolder {
-                rows.append(TreeRow(kind: .draft(folder: folder, isDirectory: draftIsDirectory), depth: depth))
-            }
+        func add(_ nodes: [FileNode], depth: Int) {
             for node in nodes {
                 if let filtered, !filtered.contains(node.relativePath) { continue }
                 let isOpen = node.isDirectory && (filtered != nil || node.isExpanded)
-                rows.append(TreeRow(kind: .node(node), depth: depth, isOpenFolder: isOpen))
+                rows.append(TreeRow(node: node, depth: depth, isOpenFolder: isOpen))
                 if isOpen, let children = node.children {
-                    add(children, depth: depth + 1, in: node.url)
+                    add(children, depth: depth + 1)
                 }
             }
         }
-        add(workspace.root.children ?? [], depth: 0, in: workspace.root.url)
+        add(workspace.root.children ?? [], depth: 0)
         return rows
     }
 }
@@ -263,7 +214,7 @@ private struct PinnedFolders: View {
         VStack(spacing: 0) {
             ForEach(tracker.pinned, id: \.index) { pinned in
                 if let node = node(at: pinned.index) {
-                    FileNodeRow(node: node, depth: rows[pinned.index].depth, workspace: workspace, isPinned: true)
+                    FileNodeRow(node: node, depth: rows[pinned.index].depth, workspace: workspace)
                         .frame(height: layout.height)
                         .padding(.leading, layout.leading)
                         .padding(.trailing, layout.trailing)
@@ -302,28 +253,17 @@ private struct PinnedFolders: View {
                     .allowsHitTesting(false)
             }
         }
-        // Names are typed in the list's own rows: bring the folder's row back.
-        .onChange(of: workspace.treeEdit) { _, edit in
-            let url: URL? = switch edit {
-            case .rename(let url): url
-            case .create(let folder, _): folder
-            case nil: nil
-            }
-            guard let url, let pinned = tracker.pinned.first(where: { node(at: $0.index)?.url == url }) else { return }
-            tracker.reveal(pinned)
-        }
         // The arrow keys can move the selection up under the pinned folders.
         .onChange(of: workspace.selection) { _, selection in
             guard let selection, !tracker.pinned.isEmpty,
-                  let index = rows.firstIndex(where: { $0.url == selection }) else { return }
+                  let index = rows.firstIndex(where: { $0.id == selection }) else { return }
             // After the list has scrolled the row into view itself.
             DispatchQueue.main.async { tracker.uncover(row: index) }
         }
     }
 
     private func node(at index: Int) -> FileNode? {
-        guard rows.indices.contains(index), case .node(let node) = rows[index].kind else { return nil }
-        return node
+        rows.indices.contains(index) ? rows[index].node : nil
     }
 }
 
@@ -377,8 +317,6 @@ private struct FileNodeRow: View {
     let node: FileNode
     let depth: Int
     let workspace: WorkspaceModel
-    /// A copy pinned over the top of the tree, outside the list.
-    var isPinned = false
 
     /// The extra leading space for each nesting level.
     static let indentWidth: CGFloat = 14
@@ -390,11 +328,6 @@ private struct FileNodeRow: View {
     /// The leading padding for a row at `depth`.
     static func leadingPadding(depth: Int) -> CGFloat {
         CGFloat(depth) * indentWidth - firstLevelShift
-    }
-
-    /// Names are typed in the list's own row, never in a pinned copy.
-    private var isRenaming: Bool {
-        !isPinned && workspace.treeEdit == .rename(node.url)
     }
 
     /// Drawn open: expanded, or shown with its matches while filtering.
@@ -420,25 +353,13 @@ private struct FileNodeRow: View {
             Group {
                 FileIcon(url: node.url, isDirectory: node.isDirectory, isExpanded: isOpen)
                     .padding(.trailing, 2)
-                if isRenaming {
-                    NameField(initialName: node.name, selectsExtension: node.isDirectory) { name in
-                        if let name { workspace.rename(node.url, to: name) } else { workspace.cancelTreeEdit() }
-                    }
-                } else {
-                    Text(highlightedName)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                Text(highlightedName)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             // Dotfiles and gitignored items fade back but stay clickable.
-            .opacity(node.isDimmed && !isRenaming ? 0.5 : 1)
+            .opacity(node.isDimmed ? 0.5 : 1)
             Spacer(minLength: 0)
-            if workspace.buffers[node.url]?.isDirty == true {
-                Circle()
-                    .fill(.primary.opacity(0.6))
-                    .frame(width: 7, height: 7)
-                    .help("Unsaved changes")
-            }
         }
         .padding(.leading, Self.leadingPadding(depth: depth))
         .tag(node.url)
@@ -481,14 +402,6 @@ private struct FileNodeMenu: View {
             Button("Open") { workspace.open(node.url) }
             Divider()
         }
-        let folder = node.isDirectory ? node.url : node.url.deletingLastPathComponent()
-        Button("New File…") { workspace.beginNewItem(isDirectory: false, in: folder) }
-        Button("New Folder…") { workspace.beginNewItem(isDirectory: true, in: folder) }
-        Divider()
-        Button("Rename…") { workspace.beginRename(node.url) }
-        Button("Duplicate") { workspace.duplicate(node.url) }
-        Button("Move to Trash") { workspace.moveToTrash(node.url) }
-        Divider()
         Button("Show in Finder") { Finder.reveal(node.url) }
         Button("Copy Path") { Finder.copyPath(node.url) }
         Button("Copy Relative Path") {
@@ -500,7 +413,7 @@ private struct FileNodeMenu: View {
 
 /// The selected row's highlight, drawn here so it's always grey. The list's own is
 /// grey after a click, which doesn't give the list keyboard focus, but turns the
-/// accent colour whenever the list does have focus (after a rename, say).
+/// accent colour whenever the list does have focus.
 private struct SelectionHighlight: View {
     let isSelected: Bool
 
@@ -553,86 +466,5 @@ private struct SystemHighlightRemover: NSViewRepresentable {
                 ancestor = view.superview
             }
         }
-    }
-}
-
-/// The row where a new file or folder gets its name.
-private struct NewItemRow: View {
-    let folder: URL
-    let isDirectory: Bool
-    let depth: Int
-    let workspace: WorkspaceModel
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Color.clear.frame(width: 12, height: 16)
-            FileIcon(url: folder.appending(path: "untitled"), isDirectory: isDirectory)
-                .padding(.trailing, 2)
-            NameField(initialName: "", selectsExtension: true) { name in
-                if let name {
-                    workspace.createItem(named: name, in: folder, isDirectory: isDirectory)
-                } else {
-                    workspace.cancelTreeEdit()
-                }
-            }
-        }
-        .padding(.leading, FileNodeRow.leadingPadding(depth: depth))
-    }
-}
-
-/// An inline name field: Return or clicking away commits, Escape cancels
-/// (`onFinish(nil)`). Renaming a file selects the name without its extension.
-private struct NameField: View {
-    let initialName: String
-    let selectsExtension: Bool
-    let onFinish: (String?) -> Void
-
-    @State private var name = ""
-    @State private var selection: TextSelection?
-    @State private var isFinished = false
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        TextField("Name", text: $name, selection: $selection)
-            .textFieldStyle(.roundedBorder)
-            .focused($isFocused)
-            .onSubmit { finish(name) }
-            .onKeyPress(.escape) {
-                finish(nil)
-                return .handled
-            }
-            .onChange(of: isFocused) { _, focused in
-                if focused {
-                    selectStem()
-                } else {
-                    finish(name.isEmpty ? nil : name)
-                }
-            }
-            .onAppear {
-                name = initialName
-                // After the row is in the list, or the focus doesn't take; once more a
-                // moment later in case the list was still laying out (e.g. just after launch).
-                DispatchQueue.main.async { isFocused = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    if !isFocused && !isFinished { isFocused = true }
-                }
-            }
-    }
-
-    /// Selects the name, without the extension when renaming a file. Done once focus
-    /// lands, since focusing a field selects all of it.
-    private func selectStem() {
-        DispatchQueue.main.async {
-            let stemEnd = selectsExtension
-                ? name.endIndex
-                : (name.lastIndex(of: ".").flatMap { $0 == name.startIndex ? nil : $0 } ?? name.endIndex)
-            selection = TextSelection(range: name.startIndex..<stemEnd)
-        }
-    }
-
-    private func finish(_ result: String?) {
-        guard !isFinished else { return }
-        isFinished = true
-        onFinish(result)
     }
 }

@@ -4,8 +4,9 @@ import Observation
 @Observable
 final class AgentSessionModel {
     var draft = ""
-    var executablePath = UserDefaults.standard.string(forKey: "codexACPExecutable") ?? "" {
-        didSet { UserDefaults.standard.set(executablePath, forKey: "codexACPExecutable") }
+    private(set) var kind: AgentKind
+    var executablePath: String {
+        didSet { UserDefaults.standard.set(executablePath, forKey: kind.executableKey) }
     }
     private(set) var isConnected = false
     private(set) var isConnecting = false
@@ -17,7 +18,6 @@ final class AgentSessionModel {
     private(set) var turns: [AgentTurn] = []
     private(set) var permissions: [AgentPermission] = []
     private(set) var configOptions: [AgentConfigOption] = []
-    private(set) var preparationStatus = ""
     /// Owned processes that outlived cleanup. Only the user can release the project then.
     private(set) var survivingProcessIDs: [Int32] = []
     @ObservationIgnored private var releasedProcessIDs: [Int32] = []
@@ -32,6 +32,9 @@ final class AgentSessionModel {
     @ObservationIgnored private var closed = false
 
     init(workspace: WorkspaceModel) {
+        let selected = UserDefaults.standard.string(forKey: "selectedAgent").flatMap(AgentKind.init(rawValue:)) ?? .codex
+        self.kind = selected
+        self.executablePath = UserDefaults.standard.string(forKey: selected.executableKey) ?? ""
         self.workspace = workspace
         transport.onNotification = { [weak self] method, params in self?.receive(method, params: params) }
         transport.onRequest = { [weak self] method, id, params in self?.handleRequest(method, id: id, params: params) }
@@ -49,13 +52,15 @@ final class AgentSessionModel {
         if isStopping { return "Stopping…" }
         if let currentTurn, isBusy { return currentTurn.status }
         if isConnecting { return "Connecting…" }
-        if isBusy { return preparationStatus.isEmpty ? "Preparing…" : preparationStatus }
+        if isBusy { return "Preparing…" }
         return isConnected ? "Connected" : "Disconnected"
     }
 
     func connect() {
-        guard !isBusy, !isConnecting else { return }
+        guard !closed, !isConnected, !isBusy, !isConnecting else { return }
+        isConnecting = true
         operation = Task { [weak self] in
+            defer { self?.isConnecting = false }
             do { try await self?.establishConnection() }
             catch { self?.errorMessage = error.localizedDescription; self?.transport.close(); self?.isConnected = false }
         }
@@ -64,13 +69,13 @@ final class AgentSessionModel {
     private func establishConnection() async throws {
         if isConnected { return }
         guard !closed, let workspace else { throw CancellationError() }
-        guard let executable = CodexRuntime.find(configuredPath: executablePath) else {
-            throw ACPError.message("Codex ACP was not found. Run scripts/install-codex-acp.sh from the checkout, or choose an installed codex-acp executable below. Node.js is required for the npm runtime.")
+        guard let executable = kind.find(configuredPath: executablePath) else {
+            throw ACPError.message("\(kind.displayName) ACP was not found. Run \(kind.installScript) from the checkout, or choose an installed \(kind.executableName) executable below. Node.js is required for the npm runtime.")
         }
         isConnecting = true; errorMessage = nil
         defer { isConnecting = false }
         releasedProcessIDs = []
-        try await transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath())
+        try await transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath(), kind: kind)
         survivingProcessIDs = []
         let initialized = try await transport.request("initialize", params: .object([
             "protocolVersion": .number(1),
@@ -81,36 +86,29 @@ final class AgentSessionModel {
         guard initialized["protocolVersion"].integer == 1 else { throw ACPError.message("The adapter did not negotiate ACP v1.") }
         agentVersion = initialized["agentInfo"]["version"].string ?? "unknown"
         let response: ACPJSON
-        if let sessionID, initialized["agentCapabilities"]["loadSession"].boolean {
-            response = try await transport.request("session/load", params: .object([
-                "sessionId": .string(sessionID), "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
-            ]))
-        } else {
-            response = try await transport.request("session/new", params: .object([
-                "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
-            ]))
-            guard let id = response["sessionId"].string else { throw ACPError.message("Codex did not create a session. Run codex login, then reconnect.") }
-            sessionID = id
-        }
-        configOptions = AgentConfigOption.parse(response["configOptions"])
-        // The pinned adapter advertises these values. Refuse an unexpected broader
-        // mode instead of inheriting a full-access setting from another client.
-        let mode = configOptions.first { $0.category == "mode" }
-        if let mode, !["workspace-write", "read-only"].contains(mode.value) {
-            guard mode.choices.contains(where: { $0.id == "workspace-write" }), let sessionID else {
-                throw ACPError.message("This session did not offer workspace-scoped permissions.")
+        do {
+            if let sessionID, initialized["agentCapabilities"]["loadSession"].boolean {
+                response = try await transport.request("session/load", params: .object([
+                    "sessionId": .string(sessionID), "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
+                ]))
+            } else {
+                response = try await transport.request("session/new", params: .object([
+                    "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
+                ]))
+                sessionID = response["sessionId"].string
             }
-            let adjusted = try await transport.request("session/set_config_option", params: .object([
-                "sessionId": .string(sessionID), "configId": .string(mode.id), "value": .string("workspace-write")
-            ]))
-            configOptions = AgentConfigOption.parse(adjusted["configOptions"])
+        } catch let error as ACPError {
+            throw ACPError.message("\(error.localizedDescription) \(kind.loginHint)")
         }
+        guard let sessionID else { throw ACPError.message("\(kind.displayName) did not create a session. \(kind.loginHint)") }
+        configOptions = try await kind.sessionOptions(response, sessionID: sessionID, transport: transport)
         isConnected = true
     }
 
     func setConfiguration(_ option: AgentConfigOption, value: String) {
-        guard !isBusy, !isConnecting, let sessionID, option.choices.contains(where: { $0.id == value }) else { return }
-        if option.category == "mode", !["workspace-write", "read-only"].contains(value) { return }
+        guard isConnected, !isBusy, !isConnecting, let sessionID, let option = configOptions.first(where: { $0.id == option.id }),
+              option.choices.contains(where: { $0.id == value }) else { return }
+        if option.category == "mode", !kind.allowedModes.contains(value) { return }
         isConnecting = true
         operation = Task { [weak self] in
             guard let self else { return }
@@ -119,7 +117,7 @@ final class AgentSessionModel {
                 let response = try await transport.request("session/set_config_option", params: .object([
                     "sessionId": .string(sessionID), "configId": .string(option.id), "value": .string(value)
                 ]))
-                configOptions = AgentConfigOption.parse(response["configOptions"])
+                applyConfiguration(response["configOptions"])
             } catch { errorMessage = error.localizedDescription }
         }
     }
@@ -128,37 +126,24 @@ final class AgentSessionModel {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isBusy, !isConnecting, !prompt.isEmpty, !closed else { return }
         guard prompt.utf8.count <= 32_768 else { errorMessage = "Keep a message under 32 KiB."; return }
-        guard turns.count < 20 else { errorMessage = "This preview keeps up to 20 turns in a chat. Start a new chat to continue."; return }
+        guard turns.count < 100 else { errorMessage = "Silica keeps up to 100 turns in a chat. Start a new chat to continue."; return }
         isBusy = true; isStopping = false; canForceDisconnect = false; errorMessage = nil
-        preparationStatus = "Preparing…"
         operation = Task { [weak self] in await self?.runTurn(prompt) }
     }
 
     private func runTurn(_ prompt: String) async {
         guard let workspace else { isBusy = false; return }
         var lease: UUID?
-        var baseline: TurnSnapshot?
-        var budget = 0
+        let root = workspace.rootURL
         let turn = AgentTurn(number: turns.count + 1, prompt: prompt)
         var failed = false
         var cancelled = false
         do {
             try await establishConnection()
             try Task.checkCancellation()
-            lease = try AgentWorkspaceCoordinator.shared.acquire(for: workspace)
-            let remaining = 100 * 1_048_576 - turns.reduce(0) { $0 + $1.storedBytes }
-            guard remaining >= 2 * 1_048_576 else { throw ACPError.message("Review snapshot storage is full. Start a new chat before another task.") }
-            budget = min(50 * 1_048_576, remaining / 2)
-            preparationStatus = "Capturing baseline…"
-            let root = workspace.rootURL
-            let captureBudget = budget
-            let worker = Task.detached(priority: .userInitiated) { try TurnSnapshot.capture(root: root, byteBudget: captureBudget) }
-            baseline = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
-            try Task.checkCancellation()
-            guard let sessionID, let baseline else { throw ACPError.message("The task baseline or session is missing.") }
+            lease = try AgentWorkspaceCoordinator.shared.acquire(for: root)
+            guard let sessionID else { throw ACPError.message("The agent session is missing.") }
             currentTurn = turn; turns.append(turn); draft = ""
-            turn.baselineCapturedAt = baseline.capturedAt
-            turn.warnings = baseline.warnings
             turn.status = "Running"
             let response = try await transport.request("session/prompt", params: .object([
                 "sessionId": .string(sessionID), "prompt": .array([
@@ -200,31 +185,11 @@ final class AgentSessionModel {
             turn.status = finalStatus
         }
         turn.finishTools(cancelled || isStopping ? "cancelled" : "interrupted")
-        if let baseline {
-            if !turns.contains(where: { $0.id == turn.id }) { turns.append(turn) }
-            let finalStatus = turn.status
-            turn.status = "Capturing changes…"
-            do {
-                let root = workspace.rootURL
-                let finalBudget = budget
-                // Capture even after cancellation, retaining the partial files actually on disk.
-                let after = try await Task.detached(priority: .userInitiated) {
-                    try TurnSnapshot.capture(root: root, including: Set(baseline.entries.keys), byteBudget: finalBudget)
-                }.value
-                turn.changes = after.changes(comparedTo: baseline)
-                turn.warnings = Array(Set(turn.warnings + after.warnings)).sorted()
-                turn.endedAt = after.capturedAt
-            } catch { turn.reviewFailure = "Could not capture all final changes: \(error.localizedDescription)" }
-            if !releasedProcessIDs.isEmpty {
-                let note = "Released while Codex processes \(Self.list(releasedProcessIDs)) were still running. They may change files after this capture; treat this review as provisional."
-                turn.reviewFailure = [turn.reviewFailure, note].compactMap { $0 }.joined(separator: "\n")
-            }
-            turn.status = finalStatus
-        }
+        turn.endedAt = .now
         currentTurn = nil
         if let lease { AgentWorkspaceCoordinator.shared.release(lease) }
         workspace.refresh()
-        isBusy = false; isStopping = false; canForceDisconnect = false; preparationStatus = ""
+        isBusy = false; isStopping = false; canForceDisconnect = false
     }
 
     func stop() {
@@ -243,11 +208,17 @@ final class AgentSessionModel {
 
     func disconnect() {
         guard !isBusy || canForceDisconnect else { return }
-        Task { [weak self] in await self?.stopAndDisconnect() }
+        guard !isConnecting || isBusy else { return }
+        let idle = !isBusy
+        if idle { isConnecting = true }
+        Task { [weak self] in
+            await self?.stopAndDisconnect()
+            if idle { self?.isConnecting = false }
+        }
     }
 
     /// One cleanup attempt. If owned processes survive it, the running turn keeps
-    /// the project protected until they exit or the user releases them.
+    /// the lease until they exit or the user releases them.
     func stopAndDisconnect() async {
         cancelPermissions()
         if let sessionID { transport.notify("session/cancel", params: .object(["sessionId": .string(sessionID)])) }
@@ -261,13 +232,13 @@ final class AgentSessionModel {
     }
 
     /// The user accepts that the surviving processes are outside Silica's control:
-    /// the turn finishes with a provisional review and releases its lease.
+    /// the turn finishes and releases its lease.
     func releaseSurvivingProcesses() async {
         guard !survivingProcessIDs.isEmpty else { return }
         releasedProcessIDs = survivingProcessIDs; survivingProcessIDs = []
         transport.abandonProcesses()
         isConnected = false
-        errorMessage = "Released the project while Codex processes \(Self.list(releasedProcessIDs)) were still running."
+        errorMessage = "Released the project while \(kind.displayName) processes \(Self.list(releasedProcessIDs)) were still running."
         await operation?.value
     }
 
@@ -276,7 +247,7 @@ final class AgentSessionModel {
             let result = await transport.shutdown()
             guard releasedProcessIDs.isEmpty else { return }
             if result.isComplete { survivingProcessIDs = []; return }
-            // Do not capture a final version or release a lease while a known
+            // Do not release a lease while a known
             // owned writer is still alive. Retry cleanup without blocking AppKit.
             noteSurvivors(result)
             await Task.detached { try? await Task.sleep(for: .seconds(1)) }.value
@@ -285,8 +256,8 @@ final class AgentSessionModel {
 
     private func noteSurvivors(_ result: AgentShutdownResult) {
         survivingProcessIDs = result.remainingProcessIDs
-        errorMessage = "Codex processes \(Self.list(survivingProcessIDs)) did not stop. "
-            + (isBusy ? "Project editing stays protected while Silica keeps trying." : "Reconnect after they exit.")
+        errorMessage = "\(kind.displayName) processes \(Self.list(survivingProcessIDs)) did not stop. "
+            + (isBusy ? "Other tasks must wait while Silica keeps trying." : "Reconnect after they exit.")
         if isBusy { canForceDisconnect = true }
     }
 
@@ -295,8 +266,16 @@ final class AgentSessionModel {
     func newChat() {
         guard !isBusy, !isConnecting else { return }
         operation?.cancel(); transport.close(); isConnected = false
-        sessionID = nil; turns = []; configOptions = []; errorMessage = nil
-        workspace?.dismissFileReview()
+        sessionID = nil; turns = []; configOptions = []; errorMessage = nil; agentVersion = ""
+    }
+
+    func selectAgent(_ selected: AgentKind) {
+        guard kind != selected, !isBusy, !isConnecting, survivingProcessIDs.isEmpty else { return }
+        newChat()
+        draft = ""
+        kind = selected
+        executablePath = UserDefaults.standard.string(forKey: selected.executableKey) ?? ""
+        UserDefaults.standard.set(selected.rawValue, forKey: "selectedAgent")
     }
 
     func close() {
@@ -309,7 +288,7 @@ final class AgentSessionModel {
         guard method == "session/update", params["sessionId"].string == sessionID else { return }
         let update = params["update"]
         if update["sessionUpdate"].string == "config_option_update" {
-            configOptions = AgentConfigOption.parse(update["configOptions"])
+            if isConnected { applyConfiguration(update["configOptions"]) }
         }
         guard currentTurn != nil else { return } // Do not append session/load replay to a live turn.
         pendingUpdates.append(update)
@@ -322,18 +301,28 @@ final class AgentSessionModel {
         }
     }
 
+    private func applyConfiguration(_ values: ACPJSON) {
+        configOptions = AgentConfigOption.parse(values)
+        let current = configOptions.first { $0.category == "mode" }?.value
+        guard kind.modeDecision(offered: [], current: current) == .keep else {
+            errorMessage = "\(kind.displayName) reported an unsupported permission mode. Reconnect to continue."
+            transport.close(); isConnected = false; operation?.cancel()
+            return
+        }
+    }
+
     private func flushUpdates() {
         flushTask?.cancel(); flushTask = nil
         let updates = pendingUpdates; pendingUpdates.removeAll(keepingCapacity: true)
         if let currentTurn {
             for update in updates {
-                if !currentTurn.apply(update) { stopForEventLimit() }
+                if !currentTurn.apply(update, projectRoot: workspace?.rootURL) { stopForEventLimit() }
             }
         }
     }
 
     private func stopForEventLimit() {
-        errorMessage = "Codex exceeded the tool-state limit. This turn is stopping; partial output and changes are preserved."
+        errorMessage = "\(kind.displayName) exceeded the tool-state limit. This turn is stopping; partial output and changes are preserved."
         operation?.cancel()
     }
 
@@ -351,13 +340,13 @@ final class AgentSessionModel {
         }
         var tool = params["toolCall"].object ?? [:]
         tool["sessionUpdate"] = .string("tool_call_update")
-        if currentTurn?.apply(.object(tool)) == false {
+        if currentTurn?.apply(.object(tool), projectRoot: workspace?.rootURL) == false {
             stopForEventLimit()
             transport.respond(id: id, result: .object(["outcome": .object(["outcome": .string("cancelled")])]))
             return
         }
         let permission = AgentPermission(requestID: id,
-            title: tool["rawInput"]?["command"].string ?? tool["title"]?.string ?? "Codex requests permission",
+            title: tool["rawInput"]?["command"].string ?? tool["title"]?.string ?? "\(kind.displayName) requests permission",
             cwd: tool["rawInput"]?["cwd"].string ?? workspace?.rootURL.path ?? "",
             options: params["options"].array.compactMap { option in
                 guard let id = option["optionId"].string, let kind = option["kind"].string,

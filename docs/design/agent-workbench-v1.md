@@ -1,5 +1,7 @@
 # Silica Agent Workbench v1
 
+> 已被 [agent-viewer.md](agent-viewer.md) 取代。
+
 日期：2026-11-13。状态：首版设计；已用固定适配器 2.6.0 验证核心链路，实际预览范围见 [接入说明](codex-acp-integration.md)，其余交互仍为目标设计。
 
 ## 产品决定

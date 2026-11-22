@@ -13,7 +13,7 @@ struct SettingsView: View {
             switch self {
             case .general: "General"
             case .fontsAndColors: "Fonts & Colors"
-            case .editor: "Editor"
+            case .editor: "Viewer"
             case .about: "About"
             }
         }
@@ -280,7 +280,7 @@ private struct FontsAndColorsSettingsPane: View {
     }
 }
 
-/// What the editor shows beside the text, and indentation for new files.
+/// Text display settings.
 private struct EditorSettingsPane: View {
     @Bindable private var settings = EditorSettings.shared
 
@@ -299,12 +299,6 @@ private struct EditorSettingsPane: View {
                         Text("\(width) spaces").tag(width)
                     }
                 }
-                SettingsPicker("Indent new files with", selection: $settings.indentsWithTabs) {
-                    Text("Spaces").tag(false)
-                    Text("Tabs").tag(true)
-                }
-            } footer: {
-                Text("Files that are already indented keep their own style.")
             }
         }
     }

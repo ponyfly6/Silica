@@ -40,7 +40,6 @@ struct SilicaApp: App {
         .windowBackgroundDragBehavior(.enabled)
         .handlesExternalEvents(matching: [])
         .commands {
-            TextEditingCommands()
             AppCommands()
         }
 

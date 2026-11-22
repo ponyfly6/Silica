@@ -8,7 +8,7 @@ nonisolated struct AgentTimelineItem: Identifiable {
     var title = ""
     var text = ""
     var status = "pending"
-    var operation = ""
+    var editsFiles = false
     var cwd = ""
     var output = ""
     var contentText = ""
@@ -19,6 +19,7 @@ nonisolated struct AgentTimelineItem: Identifiable {
     var textTruncated = false
     var localStatus: String?
 
+    var displayOutput: String { output.isEmpty ? contentText : output }
     var displayStatus: String { localStatus ?? status }
     var isAwaitingExit: Bool {
         hasTerminal && exitCode == nil && !terminalDidExit && !["cancelled", "interrupted"].contains(displayStatus)
@@ -36,14 +37,13 @@ final class AgentTurn: Identifiable {
     let id = UUID()
     let number: Int
     let prompt: String
-    let startedAt = Date()
-    var baselineCapturedAt: Date?
     var endedAt: Date?
     var status = "Preparing"
     var items: [AgentTimelineItem] = []
-    var changes: [TurnFileChange] = []
-    var warnings: [String] = []
-    var reviewFailure: String?
+    private(set) var editedFiles: [String] = []
+    private var seenPaths: Set<String> = []
+    private(set) var editedFilesTruncated = false
+    private static let fileLimit = 500
     var revision = 0
     private var fallbackMessageID = UUID().uuidString
     // Keep lifecycle metadata even after the presentation limit. If that bounded
@@ -58,7 +58,6 @@ final class AgentTurn: Identifiable {
 
     init(number: Int, prompt: String) { self.number = number; self.prompt = prompt }
 
-    var storedBytes: Int { changes.reduce(0) { $0 + $1.storedBytes } }
     var hasUnfinishedCommands: Bool {
         items.contains { $0.kind == .tool && $0.isAwaitingExit } || hiddenTools.values.contains { $0.isAwaitingExit }
     }
@@ -78,7 +77,7 @@ final class AgentTurn: Identifiable {
     }
 
     @discardableResult
-    func apply(_ update: ACPJSON) -> Bool {
+    func apply(_ update: ACPJSON, projectRoot: URL? = nil) -> Bool {
         switch update["sessionUpdate"].string {
         case "agent_message_chunk":
             guard let text = update["content"]["text"].string else { return true }
@@ -94,19 +93,19 @@ final class AgentTurn: Identifiable {
         case "tool_call", "tool_call_update":
             guard let id = update["toolCallId"].string else { return true }
             if let index = items.firstIndex(where: { $0.id == id && $0.kind == .tool }) {
-                Self.patch(&items[index], update: update, retainDetails: true)
+                patch(&items[index], update: update, root: projectRoot, retainDetails: true)
             } else if hiddenTools[id] != nil || items.count >= Self.itemLimit {
                 entriesTruncated = true
                 guard hiddenTools[id] != nil || hiddenTools.count < Self.hiddenToolLimit else {
                     eventLimitExceeded = true; revision += 1; return false
                 }
                 var tool = hiddenTools[id] ?? AgentTimelineItem(id: id, kind: .tool)
-                Self.patch(&tool, update: update, retainDetails: false)
+                patch(&tool, update: update, root: projectRoot, retainDetails: false)
                 hiddenTools[id] = tool
                 fallbackMessageID = UUID().uuidString
             } else {
                 var tool = AgentTimelineItem(id: id, kind: .tool)
-                Self.patch(&tool, update: update, retainDetails: true)
+                patch(&tool, update: update, root: projectRoot, retainDetails: true)
                 items.append(tool)
                 fallbackMessageID = UUID().uuidString
             }
@@ -128,7 +127,20 @@ final class AgentTurn: Identifiable {
         return true
     }
 
-    private static func patch(_ item: inout AgentTimelineItem, update: ACPJSON, retainDetails: Bool) {
+    private func recordPath(_ value: ACPJSON, root: URL) {
+        guard !editedFilesTruncated, let path = value["path"].string,
+              let relative = AgentPaths.relativePath(path, root: root), !seenPaths.contains(relative) else { return }
+        guard editedFiles.count < Self.fileLimit else { editedFilesTruncated = true; return }
+        seenPaths.insert(relative)
+        editedFiles.append(relative)
+    }
+
+    private func patch(_ item: inout AgentTimelineItem, update: ACPJSON, root: URL?, retainDetails: Bool) {
+        if let kind = update["kind"].string { item.editsFiles = ["edit", "delete", "move"].contains(kind) }
+        if item.editsFiles, let root, !editedFilesTruncated {
+            for location in update["locations"].array { recordPath(location, root: root) }
+            for content in update["content"].array where content["type"].string == "diff" { recordPath(content, root: root) }
+        }
         if let status = update["status"].string { item.status = status }
         let meta = update["_meta"]
         if meta["terminal_info"].object != nil || update["content"].array.contains(where: { $0["type"].string == "terminal" }) {
@@ -139,26 +151,25 @@ final class AgentTurn: Identifiable {
         if meta["terminal_exit"]["signal"].string != nil { item.status = "failed" }
         guard retainDetails else { return }
         if let title = update["rawInput"]["command"].string ?? update["title"].string {
-            item.title = prefix(title, bytes: 16_384)
+            item.title = Self.prefix(title, bytes: 16_384)
             item.textTruncated = item.textTruncated || title.utf8.count > 16_384
         }
-        if let operation = update["kind"].string { item.operation = operation }
         if let cwd = meta["terminal_info"]["cwd"].string ?? update["rawInput"]["cwd"].string { item.cwd = cwd }
         if update.object?["content"] != nil {
             let text = update["content"].array.compactMap { $0["content"]["text"].string }.joined(separator: "\n")
-            item.contentText = prefix(text, bytes: outputLimit)
-            item.outputTruncated = item.outputTruncated || text.utf8.count > outputLimit
+            item.contentText = Self.prefix(text, bytes: Self.outputLimit)
+            item.outputTruncated = item.outputTruncated || text.utf8.count > Self.outputLimit
         }
         // Read/search/list deltas do not imply a terminal and need no exit event.
         if let delta = meta["terminal_output_delta"]["data"].string ?? meta["terminal_output"]["data"].string {
-            let remaining = max(0, outputLimit - item.output.utf8.count)
-            item.output += prefix(delta, bytes: remaining)
+            let remaining = max(0, Self.outputLimit - item.output.utf8.count)
+            item.output += Self.prefix(delta, bytes: remaining)
             item.outputTruncated = item.outputTruncated || delta.utf8.count > remaining
         }
         if let signal = meta["terminal_exit"]["signal"].string {
             let suffix = "\nTerminated by signal \(signal)"
-            let remaining = max(0, outputLimit - item.output.utf8.count)
-            item.output += prefix(suffix, bytes: remaining)
+            let remaining = max(0, Self.outputLimit - item.output.utf8.count)
+            item.output += Self.prefix(suffix, bytes: remaining)
             item.outputTruncated = item.outputTruncated || suffix.utf8.count > remaining
         }
     }

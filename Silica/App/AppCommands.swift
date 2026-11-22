@@ -35,19 +35,6 @@ struct AppCommands: Commands {
         }
 
         CommandGroup(replacing: .newItem) {
-            Button("New File") { workspace?.newUntitledFile() }
-                .keyboardShortcut("n")
-                .disabled(workspace == nil)
-
-            Button("New File in Project…") { workspace?.beginNewItem(isDirectory: false) }
-                .disabled(workspace == nil)
-
-            Button("New Folder") { workspace?.beginNewItem(isDirectory: true) }
-                .keyboardShortcut("n", modifiers: [.command, .option])
-                .disabled(workspace == nil)
-
-            Divider()
-
             Button("Open…") { opener.chooseAndOpen() }
                 .keyboardShortcut("o")
 
@@ -76,20 +63,6 @@ struct AppCommands: Commands {
         CommandGroup(replacing: .printItem) {}
 
         CommandGroup(replacing: .saveItem) {
-            Button("Save") { workspace?.saveActive() }
-                .keyboardShortcut("s")
-                .disabled(workspace?.activeBuffer.map { $0.isDirty || $0.isUntitled } != true)
-
-            Button("Save As…") { workspace?.saveActiveAs() }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-                .disabled(workspace?.activeBuffer?.textController == nil)
-
-            Button("Save All") { workspace?.saveAll() }
-                .keyboardShortcut("s", modifiers: [.command, .option])
-                .disabled(workspace?.hasUnsavedChanges != true)
-
-            Divider()
-
             // As in VS Code: ⌘W closes the tab, and the window once no tabs are left.
             Button("Close Tab") {
                 if let workspace, workspace.activeTab != nil {
@@ -106,7 +79,8 @@ struct AppCommands: Commands {
         }
 
         CommandGroup(replacing: .sidebar) {
-            Button(workspace?.isAgentPanelVisible == true ? "Hide Codex" : "Show Codex") { workspace?.toggleAgentPanel() }
+            let agentName = workspace?.agent.kind.displayName ?? "Agent"
+            Button(workspace?.isAgentPanelVisible == true ? "Hide \(agentName)" : "Show \(agentName)") { workspace?.toggleAgentPanel() }
                 .keyboardShortcut("r")
                 .disabled(workspace == nil)
 
@@ -117,7 +91,7 @@ struct AppCommands: Commands {
             .keyboardShortcut("b")
             .disabled(workspace == nil)
 
-            // ⇧⌘E, ⇧⌘F and ⇧⌘S are also handled by KeyWorkspace.installKeyboardShortcuts().
+            // ⇧⌘E and ⇧⌘F are also handled by KeyWorkspace.installKeyboardShortcuts().
             Button("Explorer") { workspace?.showExplorer() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(workspace == nil)
@@ -189,41 +163,32 @@ struct AppCommands: Commands {
                 .disabled(settings.isDefaultFontSize)
         }
 
-        CommandMenu("Editor") {
-            let hasText = workspace?.activeBuffer?.textController != nil
+        CommandGroup(after: .textEditing) {
+            findButton("Find in File…", action: .showFindInterface)
+                .keyboardShortcut("f")
+            findButton("Find Next", action: .nextMatch)
+                .keyboardShortcut("g")
+            findButton("Find Previous", action: .previousMatch)
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+            findButton("Use Selection for Find", action: .setSearchString)
+                .keyboardShortcut("e")
+        }
 
-            Button("Review File Changes") { workspace?.reviewActiveFile() }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(!hasText)
-
-            Button("Set File Review Baseline") { workspace?.resetFileReviewBaseline() }
-                .disabled(!hasText)
-
-            Divider()
-
+        CommandMenu("Viewer") {
             Button("Go to Line…") { workspace?.showGoToLine() }
                 .keyboardShortcut("l")
-                .disabled(!hasText)
-
-            Divider()
-
-            editorAction("Toggle Comment", #selector(EditorTextView.toggleComment(_:)), key: "/", modifiers: .command)
-            editorAction("Indent", #selector(EditorTextView.indentLines(_:)), key: "]", modifiers: .command)
-            editorAction("Outdent", #selector(EditorTextView.outdentLines(_:)), key: "[", modifiers: .command)
-
-            Divider()
-
-            editorAction("Move Line Up", #selector(EditorTextView.moveLinesUp(_:)), key: .upArrow, modifiers: .option)
-            editorAction("Move Line Down", #selector(EditorTextView.moveLinesDown(_:)), key: .downArrow, modifiers: .option)
-            editorAction("Duplicate Line Up", #selector(EditorTextView.duplicateLinesUp(_:)), key: .upArrow, modifiers: [.option, .shift])
-            editorAction("Duplicate Line Down", #selector(EditorTextView.duplicateLinesDown(_:)), key: .downArrow, modifiers: [.option, .shift])
+                .disabled(workspace?.activeBuffer?.textController == nil)
         }
     }
 
-    /// A menu item that sends `action` to the focused editor through the responder chain.
-    private func editorAction(_ title: String, _ action: Selector, key: KeyEquivalent, modifiers: EventModifiers) -> some View {
-        Button(title) { NSApp.sendAction(action, to: nil, from: nil) }
-            .keyboardShortcut(key, modifiers: modifiers)
-            .disabled(workspace?.activeBuffer?.textController == nil)
+    private func findButton(_ title: LocalizedStringKey, action: NSTextFinder.Action) -> some View {
+        let view = workspace?.activeBuffer?.textController?.textView
+        return Button(title) {
+            if let view, let window = view.window { window.makeFirstResponder(view) }
+            let item = NSMenuItem()
+            item.tag = action.rawValue
+            NSApp.sendAction(#selector(NSTextView.performTextFinderAction(_:)), to: nil, from: item)
+        }
+        .disabled(view == nil)
     }
 }

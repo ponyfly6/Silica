@@ -52,9 +52,6 @@ final class KeyWorkspace: ObservableObject {
                 workspace.showSearch()
             case "e":
                 workspace.showExplorer()
-            case "s":
-                guard workspace.activeBuffer?.textController != nil else { return event }
-                workspace.saveActiveAs()
             case "w":
                 event.window?.performClose(nil)
             // The other usual pair for stepping through tabs, next to ⌃Tab in the menu.

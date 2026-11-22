@@ -1,8 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Owns the NSTextView for one buffer. Kept alive per tab so undo history,
-/// selection and scroll position survive switching tabs.
+/// Owns the NSTextView for one buffer. Kept alive per tab so selection and scroll position survive switching tabs.
 final class TextController: NSObject, NSTextViewDelegate {
     /// What goes in the editor card: the scroll view, with the minimap beside it.
     let view: EditorContainerView
@@ -36,26 +35,22 @@ final class TextController: NSObject, NSTextViewDelegate {
         textView.drawsBackground = false
         textView.isRichText = false
         textView.importsGraphics = false
-        textView.allowsUndo = true
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.allowsUndo = false
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.isGrammarCheckingEnabled = false
         textView.isAutomaticLinkDetectionEnabled = false
         textView.isAutomaticDataDetectionEnabled = false
-        textView.smartInsertDeleteEnabled = false
         let fontSize = EditorSettings.shared.fontSize
         textView.font = Self.font(ofSize: fontSize)
         textView.textColor = .labelColor
         textView.textContainerInset = NSSize(width: 8, height: 12)
 
         textView.string = text
-        textView.language = language
-        textView.lineEnding = Self.lineEnding(of: text)
+        lineEnding = Self.lineEnding(of: text)
         applyParagraphStyle(for: textView.font!)
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         textView.delegate = self
@@ -109,22 +104,7 @@ final class TextController: NSObject, NSTextViewDelegate {
         return string.range(of: "\r").location != NSNotFound ? "\r" : "\n"
     }
 
-    var lineEnding: String { textView.lineEnding }
-
-    /// Switches highlighting and comment markers, e.g. after a rename changes the extension.
-    func setLanguage(_ language: SyntaxLanguage?) {
-        guard language != textView.language else { return }
-        textView.language = language
-        if let language {
-            highlighter = SyntaxHighlighter(textView: textView, language: language)
-            highlighter?.highlightNow()
-        } else {
-            highlighter = nil
-            if let storage = textView.textStorage {
-                storage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: NSRange(location: 0, length: storage.length))
-            }
-        }
-    }
+    private(set) var lineEnding = "\n"
 
     // MARK: Wrapping
 
@@ -325,12 +305,11 @@ final class TextController: NSObject, NSTextViewDelegate {
         textView.defaultParagraphStyle = paragraph
         textView.typingAttributes[.paragraphStyle] = paragraph
         if let storage = textView.textStorage {
-            // Directly on the storage, so it isn't an undoable edit.
             storage.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: storage.length))
         }
     }
 
-    /// Restyles the text in place; this doesn't touch undo or mark the file dirty.
+    /// Restyles the text in place.
     @objc private func fontSizeDidChange() {
         let size = EditorSettings.shared.fontSize
         let font = Self.font(ofSize: size)
@@ -367,31 +346,8 @@ final class TextController: NSObject, NSTextViewDelegate {
         scheduleStatusUpdate()
     }
 
-    func textDidChange(_ notification: Notification) {
-        highlighter?.textDidChange()
-        lineNumbers?.textDidChange()
-        if !isReplacingText, buffer?.isDirty == false {
-            buffer?.isDirty = true
-        }
-        scheduleStatusUpdate()
-    }
-
-    private var isReplacingText = false
-
-    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
-        // Recheck the target at edit time too: a symlink may have been retargeted
-        // since the last refresh. Disk synchronization remains allowed.
-        isReplacingText || buffer.map { !AgentWorkspaceCoordinator.shared.isLocked($0.url) } != false
-    }
-
-    /// Swaps in new text (the file as changed on disk) as one undoable edit that
-    /// leaves the buffer clean. Only the differing middle is replaced, so the
-    /// selection and scroll position stay put when the change is elsewhere.
-    func replaceText(with newText: String) {
-        // Disk synchronization is allowed while user editing is protected by an agent lease.
-        let wasEditable = textView.isEditable
-        textView.isEditable = true
-        defer { textView.isEditable = wasEditable }
+    /// Reload only the differing middle so positions in the surrounding text stay anchored.
+    func replaceText(with newText: String) -> Bool {
         let old = textView.string as NSString
         let new = newText as NSString
         let shared = min(old.length, new.length)
@@ -406,16 +362,29 @@ final class TextController: NSObject, NSTextViewDelegate {
 
         let range = NSRange(location: prefix, length: old.length - prefix - suffix)
         let replacement = new.substring(with: NSRange(location: prefix, length: new.length - prefix - suffix))
-        guard range.length > 0 || !replacement.isEmpty else { return }
+        guard range.length > 0 || !replacement.isEmpty else { return false }
 
-        isReplacingText = true
-        defer { isReplacingText = false }
-        textView.redetectIndentation()
-        if textView.shouldChangeText(in: range, replacementString: replacement) {
-            textView.replaceCharacters(in: range, with: replacement)
-            textView.didChangeText()
-            textView.undoManager?.setActionName("Revert")
+        let selection = textView.selectedRange()
+        let origin = scrollView.contentView.bounds.origin
+        let replacementLength = (replacement as NSString).length
+        func adjusted(_ offset: Int) -> Int {
+            if offset <= prefix { return offset }
+            if offset >= NSMaxRange(range) { return offset + replacementLength - range.length }
+            return prefix + min(offset - prefix, replacementLength)
         }
+        let attributes = textView.typingAttributes
+        textView.textStorage?.replaceCharacters(in: range, with: NSAttributedString(string: replacement, attributes: attributes))
+        lineEnding = Self.lineEnding(of: newText)
+        textView.redetectIndentation()
+        let start = adjusted(selection.location)
+        textView.setSelectedRange(NSRange(location: start, length: adjusted(NSMaxRange(selection)) - start))
+        scrollView.contentView.scroll(to: origin)
+        textView.needsDisplay = true
+        highlighter?.textDidChange()
+        lineNumbers?.textDidChange()
+        minimap.needsDisplay = true
+        scheduleStatusUpdate()
+        return true
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {

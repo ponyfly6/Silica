@@ -1,12 +1,12 @@
 import AppKit
-import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import Observation
 import UniformTypeIdentifiers
 
 /// One open file. Text files own a live `TextController` so each tab keeps
-/// its own undo history, selection and scroll position.
+/// its selection and scroll position.
 @Observable
 final class EditorBuffer: Identifiable {
     enum Content {
@@ -17,21 +17,11 @@ final class EditorBuffer: Identifiable {
         case unreadable(String)
     }
 
-    private(set) var url: URL
+    let url: URL
     let content: Content
-    /// A new file (⌘N) that hasn't been saved anywhere yet; `url` is a placeholder.
-    let isUntitled: Bool
-    private(set) var encoding: String.Encoding
-    /// Independent of saves and disk synchronization; comparisons keep their original version.
-    private(set) var reviewBaseline: FileReviewBaseline?
-
-    var isDirty = false
-    /// The file was deleted or moved away after it was opened. The tab keeps its
-    /// text; saving writes the file again.
-    private(set) var isMissingOnDisk = false
-    /// The file on disk as Silica last read or wrote it, to tell when another app
-    /// changes it.
-    @ObservationIgnored private var diskSnapshot: DiskSnapshot?
+    private var encoding: String.Encoding = .utf8
+    let isMissingOnDisk: Bool
+    @ObservationIgnored private var diskAttributes: FileAttributes?
 
     /// Where the cursor is, for the status bar.
     struct CursorStatus: Equatable {
@@ -44,7 +34,7 @@ final class EditorBuffer: Identifiable {
     var indentation = EditorTextView.Indentation(usesTabs: false, width: 4)
 
     /// Markdown files can switch between their source and a rendered preview.
-    private(set) var isMarkdown: Bool
+    let isMarkdown: Bool
     private(set) var isShowingPreview = false
     /// Created the first time the preview is shown, then kept with the tab.
     @ObservationIgnored private(set) var preview: MarkdownPreview?
@@ -70,39 +60,18 @@ final class EditorBuffer: Identifiable {
     private static let maxFileSize: Int64 = 20 * 1024 * 1024
     private static let maxImageSize: Int64 = 200 * 1024 * 1024
 
-    /// An empty, untitled file, e.g. "Untitled-1".
-    init(untitledName name: String) {
-        url = URL.untitled(name)
-        isUntitled = true
-        isMarkdown = false
-        encoding = .utf8
-        let controller = TextController(text: "", language: nil)
-        content = .text(controller)
-        controller.buffer = self
-        controller.updateStatus()
-        captureReviewBaseline()
-    }
-
-    /// Whether closing it should ask to save: edited files, and untitled ones with
-    /// any text (an empty untitled tab just closes).
-    var needsSaving: Bool {
-        if isUntitled { return !(textController?.textView.string.isEmpty ?? true) }
-        return isDirty
-    }
-
     init(url: URL) {
         self.url = url
-        isUntitled = false
         self.isMarkdown = SyntaxLanguage(url: url) == .markdown
 
         // From the file system, not URL's resource cache, which can be stale when a
         // changed file is opened again.
         let attributes = Self.attributes(of: url)
-        let size = Int64(attributes?.size ?? 0)
+        diskAttributes = attributes
+        isMissingOnDisk = attributes == nil
+        let size = attributes?.size ?? 0
 
         if Self.isImage(url) {
-            encoding = .utf8
-            diskSnapshot = attributes.map { DiskSnapshot(attributes: $0, digest: nil) }
             if size > Self.maxImageSize {
                 content = .tooLarge(size)
             } else if let image = Self.loadImage(url, byteCount: size) {
@@ -115,8 +84,6 @@ final class EditorBuffer: Identifiable {
 
         if size > Self.maxFileSize {
             content = .tooLarge(size)
-            encoding = .utf8
-            diskSnapshot = attributes.map { DiskSnapshot(attributes: $0, digest: nil) }
             return
         }
 
@@ -125,14 +92,11 @@ final class EditorBuffer: Identifiable {
             data = try Data(contentsOf: url)
         } catch {
             content = .unreadable(error.localizedDescription)
-            encoding = .utf8
             return
         }
-        diskSnapshot = attributes.map { DiskSnapshot(attributes: $0, digest: Self.digest(of: data)) }
 
         guard !Self.looksBinary(data), let (text, encoding) = Self.decode(data) else {
             content = .binary
-            encoding = .utf8
             return
         }
 
@@ -141,15 +105,6 @@ final class EditorBuffer: Identifiable {
         content = .text(controller)
         controller.buffer = self
         controller.updateStatus()
-        captureReviewBaseline()
-    }
-
-    @discardableResult
-    func captureReviewBaseline() -> Bool {
-        guard let text = textController?.textView.string,
-              text.utf8.count <= GitDiffEngine.maximumInputBytes else { return false }
-        reviewBaseline = FileReviewBaseline(text: text, capturedAt: .now)
-        return true
     }
 
     // MARK: Status
@@ -179,37 +134,6 @@ final class EditorBuffer: Identifiable {
         }
     }
 
-    // MARK: Renaming
-
-    /// Follows a rename or move made in Silica: same text, edits and undo history,
-    /// new location (and language, if the extension changed).
-    func move(to newURL: URL) {
-        url = newURL
-        let newLanguage = SyntaxLanguage(url: newURL)
-        isMarkdown = newLanguage == .markdown
-        // The preview resolves images relative to the old place; make a new one when needed.
-        isShowingPreview = isShowingPreview && isMarkdown
-        preview = nil
-        if isShowingPreview, let controller = textController {
-            let preview = makePreview(for: controller)
-            self.preview = preview
-            preview.show(markdown: controller.textView.string, line: controller.topVisibleLine())
-        }
-        textController?.setLanguage(newLanguage)
-    }
-
-    /// Writes the text to another file (Save As), leaving this buffer as it is.
-    func write(to destination: URL) throws {
-        guard !AgentWorkspaceCoordinator.shared.isLocked(destination) else {
-            throw ACPError.message("Codex is working in the destination project. Wait before saving this file.")
-        }
-        guard let controller = textController else { return }
-        guard let data = controller.textView.string.data(using: encoding) else {
-            throw CocoaError(.fileWriteInapplicableStringEncoding, userInfo: [NSURLErrorKey: destination])
-        }
-        try data.write(to: destination.resolvingSymlinksInPath(), options: .atomic)
-    }
-
     // MARK: Markdown preview
 
     func togglePreview() {
@@ -217,17 +141,17 @@ final class EditorBuffer: Identifiable {
     }
 
     /// Switches between source and preview, keeping roughly the same place in the
-    /// document. `editLine` (from a double-click) puts the cursor on that source line.
-    func setShowingPreview(_ show: Bool, editLine: Int? = nil) {
+    /// document. `sourceLine` (from a double-click) puts the cursor on that source line.
+    func setShowingPreview(_ show: Bool, sourceLine: Int? = nil) {
         guard isMarkdown, let controller = textController, show != isShowingPreview else { return }
         if show {
-            let preview = self.preview ?? makePreview(for: controller)
+            let preview = self.preview ?? makePreview()
             self.preview = preview
             preview.show(markdown: controller.textView.string, line: controller.topVisibleLine())
             isShowingPreview = true
-        } else if let editLine {
+        } else if let sourceLine {
             isShowingPreview = false
-            DispatchQueue.main.async { controller.scroll(toLine: editLine, placingCursor: true) }
+            DispatchQueue.main.async { controller.scroll(toLine: sourceLine, placingCursor: true) }
         } else {
             preview?.topVisibleLine { [weak self] line in
                 self?.isShowingPreview = false
@@ -236,145 +160,50 @@ final class EditorBuffer: Identifiable {
         }
     }
 
-    private func makePreview(for controller: TextController) -> MarkdownPreview {
+    private func makePreview() -> MarkdownPreview {
         let preview = MarkdownPreview(fileURL: url)
         preview.onOpenFile = { [weak self] url in self?.openFile?(url) }
-        preview.onEditLine = { [weak self] line in self?.setShowingPreview(false, editLine: line) }
-        preview.onType = { [weak self] characters in
-            guard let self else { return }
-            self.isShowingPreview = false
-            // Once the editor is back in the card, type the character there.
-            DispatchQueue.main.async {
-                controller.textView.insertText(characters, replacementRange: controller.textView.selectedRange())
-            }
-        }
+        preview.onShowSourceLine = { [weak self] line in self?.setShowingPreview(false, sourceLine: line) }
         return preview
-    }
-
-    func save() throws {
-        guard !AgentWorkspaceCoordinator.shared.isLocked(url) else {
-            throw ACPError.message("Codex is working in this file’s project. Wait before saving this file.")
-        }
-        guard !isUntitled, let controller = textController else { return }
-        guard let data = controller.textView.string.data(using: encoding) else {
-            throw CocoaError(.fileWriteInapplicableStringEncoding, userInfo: [NSURLErrorKey: url])
-        }
-        // Through a symlink to its target: an atomic write to the link itself would
-        // swap it for a regular file and leave the real file unchanged.
-        try data.write(to: url.resolvingSymlinksInPath(), options: .atomic)
-        diskSnapshot = Self.attributes(of: url).map { DiskSnapshot(attributes: $0, digest: Self.digest(of: data)) }
-        isDirty = false
-        isMissingOnDisk = false
     }
 
     // MARK: Changes on disk
 
-    enum DiskChange {
-        case unchanged
-        case modified(Data?)
-        case deleted
-    }
-
-    /// Compares the file on disk with what Silica last read or wrote. A new
-    /// modification date with the same bytes (a `touch`, a checkout of the same
-    /// content) counts as unchanged.
-    func diskChange() -> DiskChange {
-        guard let attributes = Self.attributes(of: url) else { return .deleted }
-        guard let snapshot = diskSnapshot else { return .modified(nil) }
-        if snapshot.matches(attributes) { return .unchanged }
-        // Images and other files that aren't kept as text are compared by date and size only.
-        guard snapshot.digest != nil else { return .modified(nil) }
-        guard let data = try? Data(contentsOf: url) else { return .deleted }
-        if Self.digest(of: data) == snapshot.digest {
-            diskSnapshot = DiskSnapshot(attributes: attributes, digest: snapshot.digest)
-            return .unchanged
-        }
-        return .modified(data)
-    }
-
-    /// Notes whether the file still exists and, for unedited text, takes in changes
-    /// made by other apps. Returns `true` if the buffer can't follow the change itself
-    /// (it isn't text) and should be opened again.
+    /// Returns true when the content type may have changed and the tab needs a new buffer.
     func syncWithDisk() -> Bool {
-        guard !isUntitled else { return false }
-        switch diskChange() {
-        case .unchanged:
-            if isMissingOnDisk { isMissingOnDisk = false }
-            return false
-        case .deleted:
-            if !isMissingOnDisk { isMissingOnDisk = true }
-            return false
-        case .modified(let data):
-            if isMissingOnDisk { isMissingOnDisk = false }
-            guard textController != nil else { return true }
-            // Edited here too: keep the edits; saving asks which version wins.
-            if !isDirty, let data { revert(to: data) }
-            return false
-        }
-    }
-
-    /// Replaces the text with the file on disk, discarding unsaved edits. It's one
-    /// undoable change, so ⌘Z brings the edits back.
-    func revertToDisk() {
-        guard let data = try? Data(contentsOf: url) else { return }
-        revert(to: data)
-    }
-
-    private func revert(to data: Data) {
-        guard let controller = textController, !Self.looksBinary(data),
-              let (text, newEncoding) = Self.decode(data) else { return }
-        encoding = newEncoding
-        controller.replaceText(with: text)
-        diskSnapshot = Self.attributes(of: url).map { DiskSnapshot(attributes: $0, digest: Self.digest(of: data)) }
-        isDirty = false
-        isMissingOnDisk = false
+        let attributes = Self.attributes(of: url)
+        guard attributes != diskAttributes else { return false }
+        guard let attributes, attributes.size <= Self.maxFileSize, let controller = textController,
+              let data = try? Data(contentsOf: url) else { return true }
+        guard !Self.looksBinary(data), let (text, encoding) = Self.decode(data) else { return true }
+        diskAttributes = attributes
+        self.encoding = encoding
+        guard controller.replaceText(with: text) else { return false }
         if isShowingPreview, let preview {
             preview.topVisibleLine { line in
                 preview.show(markdown: controller.textView.string, line: line)
             }
         }
+        return false
     }
 
-    struct DiskSnapshot {
-        let modificationDate: Date?
-        let size: Int?
-        /// SHA-256 of the bytes, for text files.
-        let digest: Data?
-
-        init(attributes: FileAttributes, digest: Data?) {
-            modificationDate = attributes.modificationDate
-            size = attributes.size
-            self.digest = digest
-        }
-
-        func matches(_ attributes: FileAttributes) -> Bool {
-            modificationDate == attributes.modificationDate && size == attributes.size
-        }
+    private struct FileAttributes: Equatable {
+        let size: Int64
+        let inode: UInt64
+        let changeSeconds: Int
+        let changeNanoseconds: Int
     }
 
-    struct FileAttributes {
-        let modificationDate: Date?
-        let size: Int?
-    }
-
-    /// The file's own date and size; for a symlink, its target's, so edits made
-    /// through the link (or to the target directly) are noticed.
+    /// stat follows symlinks. The inode and change time also catch atomic replacements
+    /// that preserve the original file size and modification date.
     private static func attributes(of url: URL) -> FileAttributes? {
-        let path = url.resolvingSymlinksInPath().path(percentEncoded: false)
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
-            return nil
-        }
-        return FileAttributes(
-            modificationDate: attributes[.modificationDate] as? Date,
-            size: (attributes[.size] as? NSNumber)?.intValue
-        )
+        var info = stat()
+        guard stat(url.path(percentEncoded: false), &info) == 0 else { return nil }
+        return FileAttributes(size: info.st_size, inode: info.st_ino,
+                              changeSeconds: info.st_ctimespec.tv_sec, changeNanoseconds: info.st_ctimespec.tv_nsec)
     }
 
-    private static func digest(of data: Data) -> Data {
-        Data(SHA256.hash(data: data))
-    }
-
-    /// Raster image formats ImageIO can decode. SVG stays text so it can be edited.
+    /// Raster image formats ImageIO can decode. SVG opens as source text.
     private static func isImage(_ url: URL) -> Bool {
         guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
         return type.conforms(to: .image) && !type.conforms(to: .svg)
@@ -417,14 +246,4 @@ final class EditorBuffer: Identifiable {
         guard raw != 0, let converted else { return nil }
         return (converted as String, String.Encoding(rawValue: raw))
     }
-}
-
-extension URL {
-    /// The placeholder location of an untitled file.
-    static func untitled(_ name: String) -> URL {
-        URL(string: "untitled:///" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name))!
-    }
-
-    /// A placeholder for a file that hasn't been saved yet: there's nothing on disk.
-    var isUntitled: Bool { scheme == "untitled" }
 }

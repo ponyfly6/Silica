@@ -99,35 +99,6 @@ nonisolated enum SyntaxLanguage: String, Sendable, CaseIterable {
         }
     }
 
-    /// Starts a line comment, for Toggle Comment; `nil` where only block comments exist.
-    var lineComment: String? {
-        switch self {
-        case .swift, .javascript, .typescript, .json, .go, .rust, .c, .cpp, .objectiveC,
-             .java, .kotlin, .csharp, .php:
-            "//"
-        case .python, .ruby, .shell, .yaml, .toml, .dockerfile, .makefile:
-            "#"
-        case .sql:
-            "--"
-        case .html, .xml, .css, .markdown:
-            nil
-        }
-    }
-
-    /// Wraps a commented line in languages without line comments.
-    var blockComment: (open: String, close: String)? {
-        switch self {
-        case .css: ("/*", "*/")
-        case .html, .xml, .markdown: ("<!--", "-->")
-        default: nil
-        }
-    }
-
-    /// Lines ending with `:` open a block (Python's `def f():`, YAML mappings).
-    var opensBlockWithColon: Bool {
-        self == .python || self == .yaml
-    }
-
     var grammar: SyntaxGrammar {
         switch self {
         case .swift: Grammars.swift

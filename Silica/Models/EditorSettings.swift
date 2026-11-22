@@ -24,7 +24,6 @@ final class EditorSettings {
         static let fontFamily = "editorFontFamily"
         static let wrapsLines = "editorWrapsLines"
         static let tabWidth = "editorTabWidth"
-        static let indentsWithTabs = "editorIndentsWithTabs"
         static let showsLineNumbers = "editorShowsLineNumbers"
         static let showsIndentGuides = "editorShowsIndentGuides"
         static let showsMinimap = "editorShowsMinimap"
@@ -55,20 +54,11 @@ final class EditorSettings {
         }
     }
 
-    /// Columns a tab character advances, and the indent step for new files.
+    /// Columns a tab character advances.
     var tabWidth: Int {
         didSet {
             guard tabWidth != oldValue else { return }
             store(tabWidth, Key.tabWidth, isDefault: tabWidth == 4)
-            NotificationCenter.default.post(name: .editorSettingsDidChange, object: self)
-        }
-    }
-
-    /// How files with no indentation yet are indented; others keep their own style.
-    var indentsWithTabs: Bool {
-        didSet {
-            guard indentsWithTabs != oldValue else { return }
-            store(indentsWithTabs, Key.indentsWithTabs, isDefault: !indentsWithTabs)
             NotificationCenter.default.post(name: .editorSettingsDidChange, object: self)
         }
     }
@@ -149,7 +139,6 @@ final class EditorSettings {
         wrapsLines = defaults.object(forKey: Key.wrapsLines) as? Bool ?? true
         let storedTabWidth = defaults.integer(forKey: Key.tabWidth)
         tabWidth = Self.tabWidths.contains(storedTabWidth) ? storedTabWidth : 4
-        indentsWithTabs = defaults.bool(forKey: Key.indentsWithTabs)
         showsLineNumbers = defaults.object(forKey: Key.showsLineNumbers) as? Bool ?? true
         showsIndentGuides = defaults.object(forKey: Key.showsIndentGuides) as? Bool ?? true
         showsMinimap = defaults.bool(forKey: Key.showsMinimap)

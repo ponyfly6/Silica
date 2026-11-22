@@ -1,15 +1,11 @@
 import AppKit
 import SwiftUI
 
-/// Keeps a project window from closing, and the app from quitting, without asking
-/// about unsaved files. Also shows the dot in the window's close button while any
-/// file is edited, as document windows do.
-///
+/// Confirms closing or quitting while an agent is working.
 /// SwiftUI owns the window's delegate, so a proxy is put in front of it: it answers
 /// `windowShouldClose(_:)` and forwards everything else to SwiftUI's delegate.
-struct UnsavedChangesGuard: NSViewRepresentable {
+struct AgentCloseGuard: NSViewRepresentable {
     let workspace: WorkspaceModel
-    let hasUnsavedChanges: Bool
 
     func makeNSView(context: Context) -> GuardView {
         GuardView(workspace: workspace)
@@ -18,7 +14,6 @@ struct UnsavedChangesGuard: NSViewRepresentable {
     func updateNSView(_ nsView: GuardView, context: Context) {
         nsView.workspace = workspace
         nsView.installDelegateProxy()
-        nsView.window?.isDocumentEdited = hasUnsavedChanges
     }
 
     final class GuardView: NSView {
@@ -43,7 +38,6 @@ struct UnsavedChangesGuard: NSViewRepresentable {
             if window != nil {
                 Self.all.add(self)
                 installDelegateProxy()
-                window?.isDocumentEdited = workspace?.hasUnsavedChanges == true
             } else {
                 Self.all.remove(self)
             }
@@ -67,13 +61,13 @@ struct UnsavedChangesGuard: NSViewRepresentable {
 
         // MARK: Quitting
 
-        /// Asks about unsaved files in each project window in turn. `completion(false)`
+        /// Checks each busy project window in turn. `completion(false)`
         /// if the user cancelled in any of them.
         static func confirmQuitting(completion: @escaping (Bool) -> Void) {
             confirm(pending[...], completion: completion)
         }
 
-        static var hasUnsavedChanges: Bool { !pending.isEmpty }
+        static var needsConfirmation: Bool { !pending.isEmpty }
 
         private static var pending: [GuardView] {
             all.allObjects.filter { $0.window != nil && $0.workspace?.needsCloseConfirmation == true }

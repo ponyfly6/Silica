@@ -14,7 +14,7 @@ struct ProjectOpener {
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
-        panel.canCreateDirectories = true
+        panel.canCreateDirectories = false
         panel.prompt = "Open"
         panel.message = "Choose a project folder or files to open in Silica"
         guard panel.runModal() == .OK else { return }

@@ -13,14 +13,12 @@ import WebKit
 /// `silica-preview:` scheme, links to project files open in Silica, and web links open
 /// in the browser.
 final class MarkdownPreview: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-    let webView: PreviewWebView
+    let webView: WKWebView
 
     /// Opens another file in the project (a link to it was clicked).
     var onOpenFile: ((URL) -> Void)?
-    /// Double-click: edit the source at this 1-based line.
-    var onEditLine: ((Int) -> Void)?
-    /// A character was typed; switch to the source and insert it.
-    var onType: ((String) -> Void)?
+    /// Double-click: show the source at this 1-based line.
+    var onShowSourceLine: ((Int) -> Void)?
 
     private let fileURL: URL
     private var pendingLine: Int?
@@ -39,7 +37,7 @@ final class MarkdownPreview: NSObject, WKNavigationDelegate, WKScriptMessageHand
         configuration.userContentController.addUserScript(WKUserScript(
             source: Self.script, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: .defaultClient
         ))
-        webView = PreviewWebView(frame: .zero, configuration: configuration)
+        webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
 
         // Through a weak proxy: the content controller retains its handlers.
@@ -47,7 +45,6 @@ final class MarkdownPreview: NSObject, WKNavigationDelegate, WKScriptMessageHand
         webView.navigationDelegate = self
         webView.underPageBackgroundColor = .clear
         webView.setValue(false, forKey: "drawsBackground")
-        webView.onType = { [weak self] characters in self?.onType?(characters) }
         NotificationCenter.default.addObserver(
             self, selector: #selector(syntaxThemeDidChange),
             name: .syntaxThemeDidChange, object: nil
@@ -119,7 +116,7 @@ final class MarkdownPreview: NSObject, WKNavigationDelegate, WKScriptMessageHand
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if let line = message.body as? Int {
-            onEditLine?(line)
+            onShowSourceLine?(line)
         }
     }
 
@@ -224,22 +221,6 @@ final class MarkdownPreview: NSObject, WKNavigationDelegate, WKScriptMessageHand
       window.webkit.messageHandlers.silica.postMessage(block ? +block.dataset.line : 1);
     });
     """
-}
-
-/// The preview's web view: printable keys hand control back to the editor.
-final class PreviewWebView: WKWebView {
-    var onType: ((String) -> Void)?
-
-    override func keyDown(with event: NSEvent) {
-        let modifiers = event.modifierFlags.intersection([.command, .control])
-        if modifiers.isEmpty, let characters = event.characters, !characters.isEmpty,
-           characters.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.controlCharacters.contains($0) && $0.value < 0xF700 }) {
-            onType?(characters)
-            return
-        }
-        // Space, arrows and page keys keep scrolling the preview.
-        super.keyDown(with: event)
-    }
 }
 
 private final class WeakScriptHandler: NSObject, WKScriptMessageHandler {

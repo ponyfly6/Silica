@@ -113,7 +113,7 @@ struct WorkspaceView: View {
         }
         .navigationTitle(workspace.name)
         .background(KeyWindowTracker(workspace: workspace))
-        .background(UnsavedChangesGuard(workspace: workspace, hasUnsavedChanges: workspace.hasUnsavedChanges))
+        .background(AgentCloseGuard(workspace: workspace))
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             workspace.refresh()
         }

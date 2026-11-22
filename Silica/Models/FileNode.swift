@@ -94,11 +94,9 @@ final class FileNode: Identifiable {
             .filter { !Self.hiddenNames.contains($0.lastPathComponent) }
             .map { childURL in
                 let isDir = (try? childURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                let normalized = URL(
-                    filePath: childURL.path(percentEncoded: false),
-                    directoryHint: isDir ? .isDirectory : .notDirectory
-                )
                 let name = childURL.lastPathComponent
+                // Use the window's spelling even when directory enumeration resolves a symlink.
+                let normalized = url.appending(path: name, directoryHint: isDir ? .isDirectory : .notDirectory)
                 let path = relativePath.isEmpty ? name : relativePath + "/" + name
                 return FileNode(
                     url: normalized,

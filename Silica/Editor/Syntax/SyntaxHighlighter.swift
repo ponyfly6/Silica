@@ -1,11 +1,7 @@
 import AppKit
 
 /// Colors an NSTextView's text using a `SyntaxGrammar`.
-///
-/// Only the foreground color attribute is touched, directly on the text storage,
-/// so highlighting never marks the document dirty or adds undo steps. After an edit,
-/// the whole document is re-tokenized off the main thread once typing pauses briefly;
-/// meanwhile newly typed text inherits the color of the text around it.
+/// Disk changes are coalesced before tokenizing the new text.
 final class SyntaxHighlighter {
     private weak var textView: NSTextView?
     private let grammar: SyntaxGrammar
@@ -16,7 +12,7 @@ final class SyntaxHighlighter {
     private static let maxLength = 2_000_000
     /// Up to this size the first pass runs synchronously, so files open already colored.
     private static let synchronousLength = 100_000
-    private static let editDelay: Duration = .milliseconds(120)
+    private static let reloadDelay: Duration = .milliseconds(120)
 
     init(textView: NSTextView, language: SyntaxLanguage) {
         self.textView = textView
@@ -39,7 +35,7 @@ final class SyntaxHighlighter {
     }
 
     func textDidChange() {
-        schedule(after: Self.editDelay)
+        schedule(after: Self.reloadDelay)
     }
 
     private func schedule(after delay: Duration) {
@@ -71,12 +67,6 @@ final class SyntaxHighlighter {
 
     private func apply(_ tokens: [SyntaxToken]) {
         guard let textView, let storage = textView.textStorage else { return }
-        // Recoloring under in-progress IME composition would disturb the marked text.
-        if textView.hasMarkedText() {
-            schedule(after: Self.editDelay)
-            return
-        }
-
         let theme = EditorSettings.shared.syntaxTheme
         let length = storage.length
         storage.beginEditing()

@@ -17,7 +17,7 @@ sources. The managed installation lives under the user's Application Support.
 | Completion | A display terminal is identified by `terminal_info` or terminal content; `terminal_exit` is separate from tool completion. Read/search/list deltas have no terminal and require no exit event |
 | Permissions | `session/request_permission`; preserve backend option IDs, explicit allow/reject choices, cancel unanswered requests on stop/disconnect |
 | Files / terminals | Client filesystem and terminal capabilities are false. Codex's own workspace-scoped tools execute and emit output; this app does not provide a PTY |
-| Shutdown | Track descendant identities while connected; close stdin, allow the supervisor to drain, then TERM/KILL and verify known survivors. Keep the lease until shutdown completes, before capturing cancelled changes. If known processes survive KILL, only an explicit user release ends protection, and that turn's review is marked provisional. Blocked stdin cannot block escalation; pipe errors cannot terminate the app |
+| Shutdown | Track descendant identities while connected; close stdin, allow the supervisor to drain, then TERM/KILL and verify known survivors. Keep the project lease until cleanup completes or the user explicitly releases surviving processes. Blocked stdin cannot block escalation; pipe errors cannot terminate the app |
 
 Session loading replays backend history, but replay does not append to an active
 turn. There is no automatic prompt retry. Unexpected methods not advertised by the
@@ -33,35 +33,23 @@ Process cleanup verifies known descendants using PID and start time, including
 reparented children observed while connected; independently detached processes
 that escaped observation remain outside this guarantee.
 
-## Turn snapshots
+## Project tasks and edited files
 
-Acquire a lease shared across windows with overlapping canonical project roots.
-Save dirty project buffers with the user's explicit choice, protect editing and
-file mutations, then capture the baseline before sending the prompt. At task end,
-capture again and compare byte fingerprints. Include previously observed paths so
-an ignore-rule change cannot masquerade as a deletion. Native file review compares
-immutable before/after text via Git histogram; opening a file returns to its live
-version. A later turn receives a fresh baseline including manual edits.
+Before sending a prompt, acquire a lease across windows with overlapping canonical
+project roots. A prompt response can arrive before a terminal exits. The turn
+waits for that exit, including for tools omitted from the visible timeline.
+Stopping or disconnecting also waits for owned writers to exit. If processes
+survive cleanup, Release Project or Close Anyway can release the lease explicitly.
 
-Protection checks actual canonical write targets as well as project roots.
-Unrelated windows with external tabs or symlink aliases into the running project
-also become read-only. Before a task, each window saves only its edited files inside
-that project. Save As, create, rename, duplicate and delete recheck their
-targets; buffer writes have a final guard. Save panels do not create directories,
-because their folder-creation action bypasses the application's mutation guard.
+Each turn collects paths from ACP `tool_call` and `tool_call_update` events for
+edit, delete and move tools. Locations and structured diff content supply paths.
+The panel lists the first 500 unique project-relative paths in arrival order.
+Selecting one opens its current contents in the read-only viewer. Shell commands
+can change files without reporting paths. Disk notifications refresh the viewer
+and tree independently of these events.
 
-Git discovery includes tracked files even if ignored, and non-ignored untracked
-files. Non-Git discovery applies nested ignore rules and normalizes macOS `/var`
-and `/private/var` aliases before computing relative paths. External symlink
-contents are never retained. Binary/unsupported text and files over the capture
-budget keep a limitation marker. Metadata-only changes to captured text files are
-not a complete filesystem audit. External edits during a task may also be observed.
-
-Limits: 20 turns, 100 MiB retained changed-file contents, 50 MiB per snapshot,
-1 MiB text per file, 20,000 discovered files, bounded discovery/capture time.
-Limits and failures are visible. No automatic rollback or staging is provided.
-History is in memory for this window; persistence, attachments and cross-restart
-chat restoration remain future work. The panel is currently a fixed 360 pt wide.
+A window keeps up to 100 turns in memory. Starting a new chat or closing the
+window clears the conversation.
 
 ## Zed reference
 
@@ -79,26 +67,11 @@ Protocol references: [ACP v1](https://agentclientprotocol.com/protocol/v1/initia
 
 ## Verification
 
-- `bash scripts/test-review.sh`: 25 Git/diff/parser/isolation/cancellation checks.
-- `bash scripts/test-agent.sh`: framing, ordered RPC, permission responses, EOF,
-  timeout recovery, tool patches, terminal-vs-read output, Git/non-Git snapshots,
-  ignore rules, frozen history, storage bounds, path containment.
-- `bash scripts/test-agent-workspace.sh`: offline build, then the actual app's
-  workspace/coordinator/session implementation in an isolated test process:
-  cross-project Save As, symlink/external-tab editing, retargeted symlinks, nested
-  leases, cancellation, disconnect, missing exit after prompt completion, hidden
-  terminal exit and stable final snapshots after stubborn writers stop.
-- Process fixtures also cover TERM-resistant children, parent EOF/reparenting,
-  children created during shutdown and a full stdin pipe. They use disposable
-  files and never connect to an account.
-- `RUN_LIVE_CODEX_TESTS=1 bash scripts/test-agent-live.sh`: disposable synthetic
-  project only; two actual Codex turns with commands and exits, added/modified/
-  deleted files, manual edits, immutable first review, cancellation and partial
-  changes, reconnect/load, real permission rejection without a file write.
-- Native app verification uses an independent development app identity and a
-  disposable Python project: unsaved-file Save and Continue, protected editing,
-  streamed text with native inline Markdown, expandable test output/exit status,
-  two naturally completed turns (including a read tool), one-file diffs, the
-  unchanged first-turn diff after round two, and Open File back to the editor.
-  The panel layout was also checked in light appearance using a separate QA copy.
-  No user repository is sent to the smoke test.
+- `bash scripts/test-agent.sh` exercises framing, RPC, permissions, tool state,
+  edited-file extraction and process cleanup using local fixtures.
+- `bash scripts/test-agent-workspace.sh` builds the app and checks read-only
+  text, disk reload, project leases, cancellation, forced disconnect and
+  terminal exits after the prompt response or beyond the visible timeline.
+- `RUN_LIVE_CODEX_TESTS=1 bash scripts/test-agent-live.sh` opts in to a real
+  Codex account. It checks file effects on disk, cancellation, reconnect and
+  permission handling in a disposable project.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline ACP session scenarios for the real AgentSessionModel."""
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import time
 
 SESSION = "offline-fixture"
 pending_prompt = None
+ignore_cancel = False
 
 
 def emit(value):
@@ -39,6 +41,12 @@ while time.monotonic() < deadline:
     pathlib.Path("writer.pid").write_text(str(child.pid))
 
 
+def mode_options(current, values):
+    return [{"type": "select", "id": "permission-mode", "category": "mode", "name": "Mode",
+             "currentValue": current, "options": [{"value": value, "name": value} for value in values]}]
+
+
+claude = pathlib.Path(sys.argv[0]).name == "claude-fixture"
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
@@ -46,15 +54,39 @@ for line in sys.stdin:
     if method == "initialize":
         respond(ident, {"protocolVersion": 1, "agentInfo": {"version": "offline"}, "agentCapabilities": {"loadSession": True}})
     elif method in ("session/new", "session/load"):
-        respond(ident, {"sessionId": SESSION, "configOptions": []})
+        if claude:
+            assert method == "session/new" and "INITIAL_AGENT_MODE" not in os.environ
+            options = mode_options("bypassPermissions", ["bypassPermissions", "auto", "default"])
+        else:
+            assert os.environ.get("INITIAL_AGENT_MODE") == "workspace-write"
+            options = []
+        respond(ident, {"sessionId": SESSION, "configOptions": options})
+    elif method == "session/set_config_option":
+        assert claude and request["params"] == {"sessionId": SESSION, "configId": "permission-mode", "value": "auto"}
+        pathlib.Path("selected-mode").write_text(request["params"]["value"])
+        respond(ident, {"configOptions": mode_options("auto", ["bypassPermissions", "auto", "default"])})
     elif method == "session/cancel":
-        if pending_prompt:
+        if pending_prompt and not ignore_cancel:
             respond(pending_prompt, {"stopReason": "cancelled"})
             pending_prompt = None
     elif method == "session/prompt":
         prompt = request["params"]["prompt"][0]["text"]
-        if "fixture:overflow" in prompt:
-            for index in range(500):
+        ignore_cancel = "fixture:force-disconnect" in prompt
+        if "fixture:permission-edit" in prompt:
+            path = pathlib.Path("permission.txt")
+            emit({"jsonrpc": "2.0", "id": "permission", "method": "session/request_permission",
+                  "params": {"sessionId": SESSION,
+                             "toolCall": {"toolCallId": "edit", "kind": "edit", "locations": [{"path": str(path.resolve())}]},
+                             "options": [{"optionId": "allow", "kind": "allow_once", "name": "Allow once"}]}})
+            answer = json.loads(sys.stdin.readline())
+            if answer["result"]["outcome"].get("optionId") == "allow":
+                path.write_text("allowed\n")
+            respond(ident, {"stopReason": "end_turn"})
+        elif "fixture:overflow" in prompt:
+            pathlib.Path("edited.txt").write_text("ACP edit\n")
+            update({"sessionUpdate": "tool_call", "toolCallId": "edit", "kind": "edit",
+                    "locations": [{"path": "edited.txt"}], "status": "completed"})
+            for index in range(499):
                 update({"sessionUpdate": "tool_call", "toolCallId": str(index), "kind": "read", "status": "completed"})
                 if index % 25 == 0:
                     time.sleep(.002)

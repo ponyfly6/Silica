@@ -1,5 +1,7 @@
 # Agent Workbench v1 implementation plan
 
+> 已被 [agent-viewer.md](agent-viewer.md) 取代。
+
 设计依据：[agent-workbench-v1.md](agent-workbench-v1.md)。
 
 2026-11-16 进度：已完成首条 Codex/ACP 执行链路：固定适配器 2.6.0（Codex 0.166.0）、原生面板、权限响应、命令输出／退出码、停止／断连、重连续接、跨重叠窗口的任务租约、发送前保存和执行期间编辑保护。每轮在任务前后捕获项目快照，变更列表打开冻结的 AppKit diff。此前文件级 ⇧⌘D 比较仍独立保留。

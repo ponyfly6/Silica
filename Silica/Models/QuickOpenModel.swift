@@ -51,11 +51,6 @@ final class QuickOpenModel {
         reindex(activeFile: activeFile)
     }
 
-    /// Follows renamed files in the recent list.
-    func noteMoved(_ transform: (URL) -> URL?) {
-        recentFiles = recentFiles.map { transform($0) ?? $0 }
-    }
-
     /// From a trailing ":42" in the query: the line to go to.
     private(set) var lineTarget: Int?
     /// The query is only ":" and a number: Go to Line in the current file.

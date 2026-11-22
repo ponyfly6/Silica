@@ -10,9 +10,9 @@ xcrun swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library 
     "$SILICA_ROOT/Silica/Agent/Protocol/ACPJSON.swift" \
     "$SILICA_ROOT/Silica/Agent/Protocol/ACPTransport.swift" \
     "$SILICA_ROOT/Silica/Agent/Models/AgentTurn.swift" \
-    "$SILICA_ROOT/Silica/Agent/Support/TurnSnapshot.swift" \
+    "$SILICA_ROOT/Silica/Agent/Support/AgentKind.swift" \
+    "$SILICA_ROOT/Silica/Agent/Support/AgentPaths.swift" \
     "$SILICA_ROOT/Silica/Agent/Support/AgentProcessTree.swift" \
-    "$SILICA_ROOT/Silica/Models/GitIgnore.swift" \
     "$SILICA_ROOT/Tests/AgentCoreTests.swift" \
     -o "$SILICA_TESTS/agent-tests"
 "$SILICA_TESTS/agent-tests" "$SILICA_TESTS/fake-acp" "$SILICA_TESTS/process-acp"

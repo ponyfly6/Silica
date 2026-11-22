@@ -35,8 +35,8 @@ nonisolated final class AgentProcessTree: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var didBeginShutdown = false
 
-    init(pid: Int32) throws {
-        guard let info = Self.info(pid) else { throw ACPError.message("Could not track the Codex process.") }
+    init(pid: Int32, kind: AgentKind) throws {
+        guard let info = Self.info(pid) else { throw ACPError.message("Could not track the \(kind.displayName) process.") }
         root = Identity(info)
         known = [root]
         queue.sync { sample() }
