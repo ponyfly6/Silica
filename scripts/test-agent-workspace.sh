@@ -4,9 +4,10 @@ SILICA_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SILICA_TESTS=$(mktemp -d "${TMPDIR:-/tmp}/silica-workspace-tests.XXXXXX")
 trap 'rm -rf "$SILICA_TESTS"' EXIT
 SILICA_DERIVED="$SILICA_ROOT/.derivedData"
+# SwiftTerm generates its terminfo table with a build plugin from the locked package.
 if ! xcodebuild -scheme Silica -project "$SILICA_ROOT/Silica.xcodeproj" -configuration Debug \
     -derivedDataPath "$SILICA_DERIVED" -disableAutomaticPackageResolution \
-    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
+    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation \
     CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build > "$SILICA_TESTS/build.log" 2>&1; then
     cat "$SILICA_TESTS/build.log"
     exit 1
@@ -26,4 +27,4 @@ xcrun swiftc -swift-version 6 -default-isolation MainActor -parse-as-library \
     -Xlinker -rpath -Xlinker "$SILICA_PRODUCTS" \
     -Xlinker -rpath -Xlinker "$SILICA_PRODUCTS/Silica.app/Contents/MacOS" \
     -o "$SILICA_TESTS/agent-workspace-tests"
-"$SILICA_TESTS/agent-workspace-tests" "$SILICA_TESTS/session-acp"
+ZDOTDIR="$SILICA_TESTS" CFFIXED_USER_HOME="$SILICA_TESTS" "$SILICA_TESTS/agent-workspace-tests" "$SILICA_TESTS/session-acp"

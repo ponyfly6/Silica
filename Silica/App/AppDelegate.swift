@@ -11,12 +11,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ExternalOpener.shared.open(urls)
     }
 
-    /// Quitting asks about running agents in each project window first, in a sheet,
+    /// Quitting asks about running agents and foreground commands in each project window first, in a sheet,
     /// so the answer comes back later.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard AgentCloseGuard.GuardView.needsConfirmation else { return .terminateNow }
         AgentCloseGuard.GuardView.confirmQuitting { proceed in
-            NSApp.reply(toApplicationShouldTerminate: proceed)
+            if proceed {
+                WorkspaceTerminal.hangUpForQuit { sender.reply(toApplicationShouldTerminate: true) }
+            } else {
+                sender.reply(toApplicationShouldTerminate: false)
+            }
         }
         return .terminateLater
     }

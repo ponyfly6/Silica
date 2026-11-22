@@ -84,6 +84,13 @@ struct AppCommands: Commands {
                 .keyboardShortcut("r")
                 .disabled(workspace == nil)
 
+            Button("Show Terminal") { workspace?.toggleTerminal() }
+                .keyboardShortcut("`", modifiers: .control)
+                .disabled(workspace == nil)
+
+            Button("Restart Terminal") { workspace?.terminal.restart() }
+                .disabled(workspace?.visiblePanel != .terminal)
+
             Divider()
             Button(workspace?.isSidebarVisible == false ? "Show Sidebar" : "Hide Sidebar") {
                 workspace?.toggleSidebar()
@@ -184,11 +191,15 @@ struct AppCommands: Commands {
     private func findButton(_ title: LocalizedStringKey, action: NSTextFinder.Action) -> some View {
         let view = workspace?.activeBuffer?.textController?.textView
         return Button(title) {
-            if let view, let window = view.window { window.makeFirstResponder(view) }
             let item = NSMenuItem()
             item.tag = action.rawValue
-            NSApp.sendAction(#selector(NSTextView.performTextFinderAction(_:)), to: nil, from: item)
+            if let terminal = workspace?.terminal, terminal.hasFocus {
+                terminal.view?.performTextFinderAction(item)
+            } else if let view, let window = view.window {
+                window.makeFirstResponder(view)
+                view.performTextFinderAction(item)
+            }
         }
-        .disabled(view == nil)
+        .disabled(view == nil && workspace?.visiblePanel != .terminal)
     }
 }

@@ -40,7 +40,7 @@ struct AboutSettingsView: View {
                     }
                 }
             } footer: {
-                Text("Silica’s Markdown preview and updates are built on these open-source projects.")
+                Text("Silica’s Markdown preview, terminal and updates are built on these open-source projects.")
             }
         }
         .sheet(item: $shownLicense) { acknowledgement in
@@ -114,6 +114,13 @@ struct Acknowledgement: Identifiable {
             holder: "John MacFarlane, GitHub, Inc.",
             website: URL(string: "https://github.com/swiftlang/swift-cmark")!,
             files: ["swift-cmark-COPYING"]
+        ),
+        Acknowledgement(
+            name: "SwiftTerm",
+            license: "MIT License",
+            holder: "Miguel de Icaza and contributors",
+            website: URL(string: "https://github.com/migueldeicaza/SwiftTerm")!,
+            files: ["SwiftTerm-LICENSE"]
         ),
         Acknowledgement(
             name: "Sparkle",

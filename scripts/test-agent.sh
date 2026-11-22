@@ -9,7 +9,7 @@ chmod +x "$SILICA_TESTS/fake-acp" "$SILICA_TESTS/process-acp"
 SILICA_DERIVED="$SILICA_ROOT/.derivedData"
 if ! xcodebuild -scheme Silica -project "$SILICA_ROOT/Silica.xcodeproj" -configuration Debug \
     -derivedDataPath "$SILICA_DERIVED" -disableAutomaticPackageResolution \
-    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
+    -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation \
     CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build > "$SILICA_TESTS/build.log" 2>&1; then
     cat "$SILICA_TESTS/build.log"
     exit 1

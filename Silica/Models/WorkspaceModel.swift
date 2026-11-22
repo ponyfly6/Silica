@@ -37,11 +37,14 @@ final class WorkspaceModel {
         didSet { scheduleSessionSave() }
     }
     private(set) var buffers: [URL: EditorBuffer] = [:]
-    var isAgentPanelVisible = false
+    enum PanelTab { case agent, terminal }
+    private(set) var visiblePanel: PanelTab?
+    var isAgentPanelVisible: Bool { visiblePanel == .agent }
+    let terminal: WorkspaceTerminal
     @ObservationIgnored lazy var agent = AgentSessionModel(workspace: self)
-    @ObservationIgnored private var sidebarHiddenForAgent = false
+    @ObservationIgnored private var sidebarHiddenForPanel = false
 
-    var needsCloseConfirmation: Bool { agent.isBusy || agent.isConnecting }
+    var needsCloseConfirmation: Bool { agent.isBusy || agent.isConnecting || terminal.hasForegroundJob }
 
     /// The project's window, to bring forward when a file is opened in it from outside.
     @ObservationIgnored weak var window: NSWindow?
@@ -59,6 +62,7 @@ final class WorkspaceModel {
 
     init(rootURL: URL) {
         self.rootURL = rootURL
+        self.terminal = WorkspaceTerminal(directory: rootURL)
         self.isAccessingScope = rootURL.startAccessingSecurityScopedResource()
         self.root = FileNode(root: rootURL)
         self.quickOpen = QuickOpenModel(rootURL: rootURL)
@@ -73,11 +77,12 @@ final class WorkspaceModel {
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.saveSession() }
+            MainActor.assumeIsolated { self?.close() }
         }
     }
 
     func close() {
+        terminal.stop()
         agent.close()
         saveSession()
         if let terminationObserver {
@@ -116,26 +121,45 @@ final class WorkspaceModel {
     }
 
     func toggleSidebar() {
-        sidebarHiddenForAgent = false
+        sidebarHiddenForPanel = false
         withAnimation(.snappy) { isSidebarVisible.toggle() }
     }
 
     func toggleAgentPanel() {
+        if visiblePanel == .agent { hidePanel() }
+        else { showPanel(.agent) }
+    }
+
+    func toggleTerminal() {
+        if visiblePanel == .terminal && terminal.hasFocus { hidePanel() }
+        else { showPanel(.terminal) }
+    }
+
+    func hidePanel() {
         hideQuickOpen()
-        if isAgentPanelVisible {
-            isAgentPanelVisible = false
-            if sidebarHiddenForAgent { isSidebarVisible = true; sidebarHiddenForAgent = false }
-        } else {
+        visiblePanel = nil
+        if sidebarHiddenForPanel { isSidebarVisible = true; sidebarHiddenForPanel = false }
+        if let editor = activeBuffer?.textController?.textView { window?.makeFirstResponder(editor) }
+    }
+
+    func showPanel(_ tab: PanelTab) {
+        hideQuickOpen()
+        if visiblePanel == nil {
             let defaults = UserDefaults.standard
             let sidebar = defaults.object(forKey: "sidebarWidth") as? Double ?? WorkspaceLayout.defaultSidebarWidth
             let panel = defaults.object(forKey: "agentPanelWidth") as? Double ?? WorkspaceLayout.defaultPanelWidth
             let needed = WorkspaceLayout.clampedSidebarWidth(sidebar) + WorkspaceLayout.minimumEditorWidth
                 + WorkspaceLayout.panelWidth(preferred: panel, available: .infinity)
             if isSidebarVisible, let width = window?.contentView?.bounds.width, width < needed {
-                isSidebarVisible = false; sidebarHiddenForAgent = true
+                isSidebarVisible = false; sidebarHiddenForPanel = true
             }
-            isAgentPanelVisible = true
-            agent.connect()
+        }
+        visiblePanel = tab
+        switch tab {
+        case .agent: agent.connect()
+        case .terminal:
+            terminal.startIfNeeded()
+            terminal.focus()
         }
     }
 
@@ -484,27 +508,34 @@ final class WorkspaceModel {
         return URL(filePath: absolute, directoryHint: .notDirectory)
     }
 
-    func confirmClosing(in window: NSWindow, completion: @escaping (Bool) -> Void) {
-        guard needsCloseConfirmation else { completion(true); return }
+    func confirmClosing(in window: NSWindow, terminalConfirmed: Bool = false, completion: @escaping (Bool) -> Void) {
+        let busyAgent = agent.isBusy || agent.isConnecting
+        let busyTerminal = !terminalConfirmed && terminal.hasForegroundJob
+        guard busyAgent || busyTerminal else { completion(true); return }
         let survivors = agent.survivingProcessIDs
         let alert = NSAlert()
-        if survivors.isEmpty {
+        let hangupMessage = "Closing hangs up the shell. Jobs started with nohup can keep running."
+        if !busyAgent && survivors.isEmpty {
+            alert.messageText = "A command is still running in the terminal."
+            alert.informativeText = hangupMessage
+        } else if survivors.isEmpty {
             alert.messageText = "\(agent.kind.displayName) is still working in this window."
             alert.informativeText = "Stopping closes this connection. Files already changed remain on disk."
-            alert.addButton(withTitle: "Keep Open")
-            alert.addButton(withTitle: "Stop and Close")
         } else {
             alert.messageText = "Some \(agent.kind.displayName) processes did not stop."
             alert.informativeText = "Processes \(survivors.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files in this project after the window closes."
-            alert.addButton(withTitle: "Keep Open")
-            alert.addButton(withTitle: "Close Anyway")
         }
+        if busyTerminal && (busyAgent || !survivors.isEmpty) {
+            alert.informativeText += " A command is still running in the terminal. \(hangupMessage)"
+        }
+        alert.addButton(withTitle: "Keep Open")
+        alert.addButton(withTitle: survivors.isEmpty ? "Stop and Close" : "Close Anyway")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertSecondButtonReturn else { completion(false); return }
             Task {
-                if survivors.isEmpty { await self.agent.stopAndDisconnect() }
-                else { await self.agent.releaseSurvivingProcesses() }
-                self.confirmClosing(in: window, completion: completion)
+                if !survivors.isEmpty { await self.agent.releaseSurvivingProcesses() }
+                else if busyAgent { await self.agent.stopAndDisconnect() }
+                self.confirmClosing(in: window, terminalConfirmed: terminalConfirmed || busyTerminal, completion: completion)
             }
         }
     }

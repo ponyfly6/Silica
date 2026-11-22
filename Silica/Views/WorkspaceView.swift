@@ -90,15 +90,15 @@ struct WorkspaceView: View {
                         .frame(width: visibleSidebarWidth)
                         .overlay(alignment: .trailing) {
                             resizeHandle(leading: false, width: visibleSidebarWidth) { proposed in
-                                let reserved = workspace.isAgentPanelVisible ? WorkspaceLayout.panelWidthRange.lowerBound : 0
+                                let reserved = workspace.visiblePanel != nil ? WorkspaceLayout.panelWidthRange.lowerBound : 0
                                 sidebarWidth = WorkspaceLayout.clampedSidebarWidth(min(proposed, geometry.size.width - reserved - WorkspaceLayout.minimumEditorWidth))
                             }
                         }
                         .transition(.move(edge: .leading).combined(with: .opacity))
                 }
                 EditorArea(workspace: workspace)
-                if workspace.isAgentPanelVisible {
-                    AgentPanelView(model: workspace.agent, workspace: workspace)
+                if workspace.visiblePanel != nil {
+                    SidePanelView(workspace: workspace)
                         .frame(width: panelWidth)
                         .overlay(alignment: .leading) {
                             resizeHandle(leading: true, width: panelWidth) { proposed in
@@ -117,8 +117,8 @@ struct WorkspaceView: View {
             }
         }
         .frame(minWidth: max(640, visibleSidebarWidth + WorkspaceLayout.minimumEditorWidth
-                             + (workspace.isAgentPanelVisible ? WorkspaceLayout.panelWidthRange.lowerBound : 0)),
-               minHeight: workspace.isAgentPanelVisible ? 520 : 400)
+                             + (workspace.visiblePanel != nil ? WorkspaceLayout.panelWidthRange.lowerBound : 0)),
+               minHeight: workspace.visiblePanel != nil ? 520 : 400)
         .containerBackground(for: .window) {
             VisualEffectView()
         }

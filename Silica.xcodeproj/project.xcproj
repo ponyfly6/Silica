@@ -23,6 +23,12 @@
       "version": {
         "up-to-next-major-version": "2.7.0",
       },
+    }, {
+      "kind": "remote",
+      "repository": "https://github.com/migueldeicaza/SwiftTerm",
+      "version": {
+        "up-to-next-major-version": "1.99.3",
+      },
     },
   ],
   "files": [
@@ -54,6 +60,10 @@
         }, {
           "package": "swift-markdown",
           "product-name": "Markdown",
+          "build-phase": { "build-phase": "frameworks" },
+        }, {
+          "package": "SwiftTerm",
+          "product-name": "SwiftTerm",
           "build-phase": { "build-phase": "frameworks" },
         },
       ],

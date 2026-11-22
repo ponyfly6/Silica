@@ -1,6 +1,6 @@
 # Silica Workbench
 
-Silica is a native, read-only code viewer for macOS with one agent panel for Codex or Claude Code.
+Silica is a native, read-only code viewer for macOS with a side panel for Codex, Claude Code and a terminal.
 Open a project, ask the agent to make a change, and read the result in the same
 window. The file tree and open tabs follow changes on disk.
 
@@ -28,7 +28,7 @@ npm runtimes under `~/Library/Application Support/Silica Workbench/`.
 | Claude Code | `bash scripts/install-claude-acp.sh` (adapter 0.109.0, requires Node.js 22+) | Run `claude` and log in. |
 
 Press **⌘R** in a project and choose **Codex** or **Claude Code** in the
-composer. Opening the panel connects with that agent’s existing login. Drag its
+composer. Opening the Agent tab connects with that agent’s existing login. Drag its
 left edge to resize it, or double-click the edge to reset its width. Switch
 agents while idle to start a fresh chat in this window. New windows remember the
 last selection. The header gear opens connection settings with the adapter version, login instructions
@@ -64,6 +64,16 @@ Shell commands fall outside this summary. Each turn lists up to 500 distinct pro
 in its window. Start a new chat or close the window to clear that history.
 Reconnecting within the window uses ACP session loading.
 
+## Using the terminal
+
+Select **Terminal** in the side panel or press **Control + backtick** to run commands in
+the project directory with your login shell. Switching back to Agent or hiding
+the panel keeps the shell and scrollback alive. Use **⌘F** to search output,
+**⌘K** to clear it, and **⌘-click** to open a link. When the shell exits, click
+**Restart** for a fresh shell. Closing the window or quitting hangs up the shell and its job groups.
+Jobs that ignore the hang-up signal, such as a command started with `nohup`, can keep running.
+When you type `exit` or press Control-D at the prompt, the shell handles its own jobs.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -75,7 +85,8 @@ Reconnecting within the window uses ACP session loading.
 | ⇧⌘V | Toggle Markdown preview |
 | ⌘B or ⌃⌘S | Show or hide the sidebar |
 | ⌘R or ⇧⌘A | Show or hide the selected agent’s chat (opening focuses the message input) |
-| ⌘F | Find in file |
+| ⌃\` | Focus Terminal, or hide it when focused |
+| ⌘F | Find in the terminal or active file |
 | ⇧⌘R | Refresh the file tree and open files |
 | ⌃Tab / ⌃⇧Tab | Next / previous tab |
 | ⇧⌘] / ⇧⌘[ | Next / previous tab |
@@ -90,7 +101,7 @@ This development fork of upstream Silica requires Xcode 27 or later and runs on 
 1. Clone the repository and open `Silica.xcodeproj`.
 2. In the Silica target's Signing & Capabilities, choose your own team (or "Sign to
    Run Locally"). Please don't commit that change.
-3. Press ⌘R. Xcode fetches the Swift packages on the first build.
+3. Press ⌘R. Xcode fetches the Swift packages on the first build and asks to enable SwiftTerm’s build plugin, which generates its terminal capabilities table.
 
 After the first build, run both offline suites. The workspace suite builds the app
 in `.derivedData` and exercises its viewer and agent session with a local fixture.
@@ -115,6 +126,7 @@ Bug reports, ideas and pull requests are welcome. Read
 
 Silica is released under the [MIT License](LICENSE). It includes
 [swift-markdown](https://github.com/swiftlang/swift-markdown),
-[swift-cmark](https://github.com/swiftlang/swift-cmark) and
+[swift-cmark](https://github.com/swiftlang/swift-cmark),
+[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) and
 [Sparkle](https://sparkle-project.org), whose licenses are in
 `Silica/Resources/Licenses` and in Settings › About.

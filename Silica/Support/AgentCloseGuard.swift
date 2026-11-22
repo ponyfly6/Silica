@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Confirms closing or quitting while an agent is working.
+/// Confirms closing or quitting while an agent or foreground terminal job is running.
 /// SwiftUI owns the window's delegate, so a proxy is put in front of it: it answers
 /// `windowShouldClose(_:)` and forwards everything else to SwiftUI's delegate.
 struct AgentCloseGuard: NSViewRepresentable {
@@ -66,8 +66,6 @@ struct AgentCloseGuard: NSViewRepresentable {
         static func confirmQuitting(completion: @escaping (Bool) -> Void) {
             confirm(pending[...], completion: completion)
         }
-
-        static var needsConfirmation: Bool { !pending.isEmpty }
 
         private static var pending: [GuardView] {
             all.allObjects.filter { $0.window != nil && $0.workspace?.needsCloseConfirmation == true }

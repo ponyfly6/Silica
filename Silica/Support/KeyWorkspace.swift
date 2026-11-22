@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import SwiftTerm
 
 /// The workspace whose window is key, for menu commands and shortcuts to act on.
 final class KeyWorkspace: ObservableObject {
@@ -31,6 +32,16 @@ final class KeyWorkspace: ObservableObject {
                   // Not while a sheet or alert is up.
                   event.window?.attachedSheet == nil, NSApp.modalWindow == nil,
                   let key = event.charactersIgnoringModifiers?.lowercased() else { return event }
+            if flags == [.control], event.characters(byApplyingModifiers: []) == "`" {
+                if !event.isARepeat { workspace.toggleTerminal() }
+                return nil
+            }
+            if flags == [.command], key == "k", let view = workspace.terminal.view,
+               event.window?.firstResponder === view {
+                view.clearScrollback()
+                view.feed(text: "\u{1B}[2J\u{1B}[H")
+                return nil
+            }
             // Handle the chat shortcut even when its native text editor has focus.
             if flags == [.command], key == "r" {
                 if !event.isARepeat { workspace.toggleAgentPanel() }

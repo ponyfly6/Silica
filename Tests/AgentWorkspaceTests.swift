@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 import Darwin
+import SwiftUI
+import SwiftTerm
 @testable import Silica
 
 @main
@@ -329,7 +331,110 @@ struct AgentWorkspaceTests {
                 check(frozen != nil && frozen == tryContents(folder.appending(path: "heartbeat")), "\(scenario): heartbeat changed after lease release")
             }
         }
-        print("PASS: \(count) read-only viewer, workspace lease, agent preferences, session metadata, turn lifecycle, composer keys and prompt delivery checks")
+        check(viewer.terminal.view == nil, "Agent work started a terminal before first use")
+        window.contentView = NSHostingView(rootView: WorkspaceView(workspace: viewer))
+        viewer.toggleTerminal()
+        let terminal = viewer.terminal.view!
+        try await waitUntil { terminal.window === window && viewer.terminal.hasFocus }
+        terminal.send(txt: "pwd; echo SILICA_TERMINAL_OK\r")
+        func lines(_ view: ShellTerminalView) -> [String] {
+            String(decoding: view.getBufferAsData(), as: UTF8.self)
+                .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        try await waitUntil { lines(terminal).contains("SILICA_TERMINAL_OK") }
+        check(lines(terminal).joined().contains(project.path), "Login shell started outside the project")
+        check(!viewer.needsCloseConfirmation && !viewer.agent.isConnected, "Idle terminal prompted or connected the agent")
+
+        let insertion = NSRange(location: NSNotFound, length: 0)
+        terminal.send(txt: "echo ")
+        terminal.setMarkedText("zhong", selectedRange: NSRange(location: 5, length: 0), replacementRange: insertion)
+        check(terminal.hasMarkedText(), "Terminal lost the IME composition")
+        terminal.insertText("中文", replacementRange: insertion)
+        terminal.send(txt: "\r")
+        try await waitUntil { lines(terminal).contains("中文") }
+        check(!terminal.hasMarkedText(), "Committing IME input left marked text behind")
+
+        func terminalColumns() -> UInt16 {
+            var size = winsize()
+            return ioctl(terminal.process.childfd, TIOCGWINSZ, &size) == 0 ? size.ws_col : 0
+        }
+        let columns = terminalColumns()
+        defaults.set(360.0, forKey: "agentPanelWidth")
+        try await waitUntil { (1..<columns).contains(terminalColumns()) }
+        defaults.set(650.0, forKey: "agentPanelWidth")
+        try await waitUntil { terminalColumns() == columns }
+
+        let settings = EditorSettings.shared
+        let originalSize = settings.fontSize
+        settings.setFontSize(originalSize == 16 ? 17 : 16)
+        try await waitUntil { terminal.font.pointSize == settings.fontSize }
+        settings.setFontSize(originalSize)
+        try await waitUntil { terminal.font.pointSize == originalSize }
+
+        viewer.toggleTerminal()
+        check(viewer.visiblePanel == nil, "Focused Terminal shortcut did not hide the panel")
+        try await waitUntil { terminal.window == nil }
+        viewer.toggleTerminal()
+        try await waitUntil { viewer.terminal.hasFocus }
+        window.makeFirstResponder(nil)
+        viewer.toggleTerminal()
+        check(viewer.visiblePanel == .terminal && viewer.terminal.hasFocus, "Terminal shortcut did not reclaim focus")
+        viewer.toggleAgentPanel()
+        check(viewer.isAgentPanelVisible, "Agent shortcut hid the terminal instead of showing Agent")
+        try await waitUntil { !viewer.agent.isConnecting }
+        viewer.toggleAgentPanel()
+        check(viewer.visiblePanel == nil, "Agent shortcut did not hide Agent")
+        viewer.toggleTerminal()
+        check(viewer.terminal.view === terminal && lines(terminal).contains("SILICA_TERMINAL_OK"),
+              "Switching tabs or hiding the panel lost the terminal session")
+        func startNohup(in view: ShellTerminalView, pidFile: String) async throws -> ProcessIdentity {
+            // Publish the PID after nohup installed SIG_IGN. exec preserves both.
+            view.send(txt: "nohup /bin/sh -c 'echo $$ > \(pidFile); exec sleep 300' </dev/null >/dev/null 2>&1 &\r")
+            let file = project.appending(path: pidFile)
+            try await waitUntil { tryContents(file)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
+            return ProcessIdentity(Int32(tryContents(file)!.trimmingCharacters(in: .whitespacesAndNewlines))!)!
+        }
+        let exitJob = try await startNohup(in: terminal, pidFile: "exit-job.pid")
+        defer { exitJob.killIfRunning() }
+        terminal.send(txt: "disown; exit\r")
+        try await waitUntil { viewer.terminal.exited }
+        check(exitJob.isRunning, "Shell exit killed a detached nohup job")
+        exitJob.killIfRunning()
+        try await waitUntil { !exitJob.isRunning }
+        viewer.terminal.restart()
+        let restarted = viewer.terminal.view!
+        check(restarted !== terminal && !viewer.terminal.exited, "Restart retained the exited terminal")
+        try await waitUntil { restarted.window === window && viewer.terminal.hasFocus }
+        let shell = ProcessIdentity(restarted.process.shellPid)!
+        restarted.send(txt: "sleep 300 & echo $! > background.pid\r")
+        let backgroundPID = project.appending(path: "background.pid")
+        try await waitUntil { tryContents(backgroundPID) != nil && !viewer.needsCloseConfirmation }
+        let background = ProcessIdentity(Int32(tryContents(backgroundPID)!.trimmingCharacters(in: .whitespacesAndNewlines))!)!
+        let closeJob = try await startNohup(in: restarted, pidFile: "close-job.pid")
+        defer { closeJob.killIfRunning() }
+        // exec keeps the foreground PID captured by the child shell.
+        restarted.send(txt: "/bin/sh -c 'echo $$ > foreground.pid; exec sleep 300'\r")
+        let foregroundPID = project.appending(path: "foreground.pid")
+        try await waitUntil { tryContents(foregroundPID) != nil && viewer.needsCloseConfirmation }
+        let foreground = ProcessIdentity(Int32(tryContents(foregroundPID)!.trimmingCharacters(in: .whitespacesAndNewlines))!)!
+        // A second window remains open when the first closes and the app quits.
+        let quitTerminal = WorkspaceTerminal(directory: project)
+        quitTerminal.startIfNeeded()
+        let quitView = quitTerminal.view!
+        let quitShell = ProcessIdentity(quitView.process.shellPid)!
+        defer { quitShell.killIfRunning() }
+        quitView.send(txt: "exec /bin/sh -c 'trap \"echo hup > quit-hup\" HUP; trap \"\" TERM; echo ready > quit-ready; while :; do read line; done'\r")
+        try await waitUntil { tryContents(project.appending(path: "quit-ready")) == "ready\n" }
+        viewer.close()
+        await withCheckedContinuation { continuation in
+            WorkspaceTerminal.hangUpForQuit { continuation.resume() }
+        }
+        check(tryContents(project.appending(path: "quit-hup")) == "hup\n", "Quit completed before delivering the hang-up")
+        try await waitUntil { !quitShell.isRunning && !shell.isRunning && !background.isRunning && !foreground.isRunning }
+        check(closeJob.isRunning, "Closing the workspace killed a nohup job")
+        closeJob.killIfRunning()
+        try await waitUntil { !closeJob.isRunning }
+        print("PASS: \(count) read-only viewer, workspace lease, agent preferences, session metadata, turn lifecycle, composer keys, prompt delivery, terminal and process cleanup checks")
     }
 
     @MainActor static func waitUntil(_ condition: () -> Bool) async throws {
@@ -341,6 +446,27 @@ struct AgentWorkspaceTests {
     }
 
     nonisolated static func tryContents(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+    private struct ProcessIdentity: Equatable {
+        let pid: Int32
+        let seconds: UInt64
+        let microseconds: UInt64
+
+        init?(_ pid: Int32) {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size && info.pbi_status != SZOMB else { return nil }
+            self.pid = pid
+            seconds = info.pbi_start_tvsec
+            microseconds = info.pbi_start_tvusec
+        }
+
+        var isRunning: Bool { Self(pid) == self }
+
+        func killIfRunning() {
+            if isRunning { kill(pid, SIGKILL) }
+        }
+    }
+
     nonisolated static func isRunning(_ pid: Int32) -> Bool {
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)

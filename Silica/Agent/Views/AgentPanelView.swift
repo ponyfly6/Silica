@@ -23,8 +23,6 @@ struct AgentPanelView: View {
                 Button { showsConnection.toggle() } label: { Image(systemName: "gearshape") }
                     .help("Connection settings").accessibilityLabel("Connection settings")
                     .popover(isPresented: $showsConnection) { connectionSettings }
-                Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sidebar.right") }
-                    .help("Hide \(model.kind.displayName) (⌘R)").accessibilityLabel("Hide \(model.kind.displayName) panel")
             }
             .buttonStyle(.borderless).foregroundStyle(.secondary)
             .frame(height: WorkspaceLayout.titleBarHeight).padding(.horizontal, 12)
