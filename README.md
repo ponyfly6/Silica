@@ -27,23 +27,40 @@ npm runtimes under `~/Library/Application Support/Silica Workbench/`.
 | Codex | `bash scripts/install-codex-acp.sh` (adapter 2.6.0, requires Node.js) | Run `codex login`. |
 | Claude Code | `bash scripts/install-claude-acp.sh` (adapter 0.109.0, requires Node.js 22+) | Run `claude` and log in. |
 
-Press **⌘R** in a project and choose **Codex** or **Claude Code** at the top of
-the panel. Opening the panel connects with that agent’s existing login. Drag its
+Press **⌘R** in a project and choose **Codex** or **Claude Code** in the
+composer. Opening the panel connects with that agent’s existing login. Drag its
 left edge to resize it, or double-click the edge to reset its width. Switch
 agents while idle to start a fresh chat in this window. New windows remember the
-last selection. Connection settings show the adapter version, login instructions
+last selection. The header gear opens connection settings with the adapter version, login instructions
 and a separate executable override for each agent. If your login expires, sign
 in again in Terminal and reconnect.
 
-Choose the model, reasoning level and permission mode next to **Send**. Silica
-remembers the model and reasoning level for each agent. The panel streams
+Use **Return** or **⌘Return** to send and **Shift-Return** for a new line. During
+IME composition, Return confirms the candidate. Type **@** to find a project
+file or start a message with **/** to see the agent’s commands. Use the arrow
+keys and Return or Tab to insert a suggestion, or Escape to close the list.
+
+Attach files with the paperclip, drop them on the composer, or paste an image.
+Each message accepts up to 10 attachments totalling 10 MB. Image-capable agents
+receive PNG, JPEG, GIF and WebP images up to 5 MB each. Agents that support
+embedded context receive text files up to 256 KiB inline. Other files and
+resolved project mentions are sent as file links.
+
+Choose a model and reasoning level from the combined menu next to **Send**.
+Silica remembers both for each agent. The permission menu sits below the card.
+Click the context meter there to see the last turn’s token and cache breakdown
+and the chat’s reported token and cost totals. The panel streams
 command output and asks for tool permissions. **Stop** cancels a task. **End Connection** becomes
 available if cancellation stalls. A running task holds a lease across windows
 that open the same project or a parent or child folder.
 
-Under each turn, **Edited by agent** links to the current files reported by ACP
-edit, delete and move tools. Changes made through shell commands are not listed.
-Each turn lists up to 500 distinct project paths. A chat holds up to 100 turns
+Hover over a message to copy it or edit it in the composer. Expand the work log
+to see plans, tools and intermediate replies. The final answer supports Markdown,
+copyable code blocks and project links such as `src/main.swift:42`.
+
+Expand **Changed files** below an answer to open files reported by ACP edit,
+delete and move tools. Line counts add up the edits reported by those tools.
+Shell commands fall outside this summary. Each turn lists up to 500 distinct project paths. A chat holds up to 100 turns
 in its window. Start a new chat or close the window to clear that history.
 Reconnecting within the window uses ACP session loading.
 

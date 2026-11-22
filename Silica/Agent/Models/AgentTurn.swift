@@ -8,7 +8,8 @@ nonisolated struct AgentTimelineItem: Identifiable {
     var title = ""
     var text = ""
     var status = "pending"
-    var editsFiles = false
+    var toolKind = ""
+    var messageID: String?
     var cwd = ""
     var output = ""
     var contentText = ""
@@ -37,14 +38,29 @@ final class AgentTurn: Identifiable {
     let id = UUID()
     let number: Int
     let prompt: String
+    let attachmentNames: [String]
+    let startedAt = Date.now
     var endedAt: Date?
+    var usage: AgentTurnUsage?
+    var cost: AgentCost?
     var status = "Preparing"
     var items: [AgentTimelineItem] = []
-    private(set) var editedFiles: [String] = []
-    private var seenPaths: Set<String> = []
-    private(set) var editedFilesTruncated = false
-    private static let fileLimit = 500
-    var revision = 0
+    private(set) var changes = AgentChanges()
+    private var answerStart = 0
+    private var overflowAnswer: AgentTimelineItem?
+    var transcript: (work: [AgentTimelineItem], answer: [AgentTimelineItem]) {
+        let tail = items[answerStart...]
+        return (Array(items[..<answerStart]) + tail.filter { $0.kind != .assistant },
+                tail.filter { $0.kind == .assistant } + [overflowAnswer].compactMap { $0 })
+    }
+
+    var stepSummary: (count: Int, failed: Int, cancelled: Int) {
+        let tools = items.filter { $0.kind == .tool } + hiddenTools.values
+        return (tools.count, tools.filter { $0.displayStatus == "failed" || ($0.exitCode ?? 0) != 0 }.count,
+                tools.filter { ["cancelled", "interrupted"].contains($0.displayStatus) }.count)
+    }
+    private var latestToolID: String?
+    private(set) var currentStepTitle = ""
     private var fallbackMessageID = UUID().uuidString
     // Keep lifecycle metadata even after the presentation limit. If that bounded
     // metadata store fills too, stop the turn instead of losing execution state.
@@ -56,7 +72,11 @@ final class AgentTurn: Identifiable {
     private static let textLimit = 262_144
     private static let outputLimit = 1_048_576
 
-    init(number: Int, prompt: String) { self.number = number; self.prompt = prompt }
+    init(number: Int, prompt: String, attachmentNames: [String] = []) {
+        self.number = number
+        self.prompt = prompt
+        self.attachmentNames = attachmentNames
+    }
 
     var hasUnfinishedCommands: Bool {
         items.contains { $0.kind == .tool && $0.isAwaitingExit } || hiddenTools.values.contains { $0.isAwaitingExit }
@@ -73,7 +93,6 @@ final class AgentTurn: Identifiable {
     func finishTools(_ reason: String) {
         for index in items.indices where items[index].kind == .tool { items[index].finish(reason) }
         for id in Array(hiddenTools.keys) { hiddenTools[id]?.finish(reason) }
-        revision += 1
     }
 
     @discardableResult
@@ -82,14 +101,20 @@ final class AgentTurn: Identifiable {
         case "agent_message_chunk":
             guard let text = update["content"]["text"].string else { return true }
             let id = update["messageId"].string ?? fallbackMessageID
-            if let index = items.firstIndex(where: { $0.id == id && $0.kind == .assistant }) {
-                let remaining = max(0, Self.textLimit - items[index].text.utf8.count)
-                items[index].text += Self.prefix(text, bytes: remaining)
-                items[index].textTruncated = items[index].textTruncated || text.utf8.count > remaining
+            if let index = items[answerStart...].firstIndex(where: { $0.messageID == id }) {
+                Self.append(text, to: &items[index])
             } else if items.count < Self.itemLimit {
-                items.append(AgentTimelineItem(id: id, kind: .assistant, text: Self.prefix(text, bytes: Self.textLimit),
-                                               textTruncated: text.utf8.count > Self.textLimit))
-            } else { entriesTruncated = true }
+                var item = AgentTimelineItem(id: "message-\(items.count)", kind: .assistant, messageID: id)
+                Self.append(text, to: &item)
+                items.append(item)
+            } else {
+                // Preserve the answer even when earlier tools exhausted the timeline.
+                var item = overflowAnswer ?? AgentTimelineItem(id: "overflow-answer", kind: .assistant)
+                if let previous = item.messageID, previous != id { Self.append("\n\n", to: &item) }
+                item.messageID = id
+                Self.append(text, to: &item)
+                overflowAnswer = item
+            }
         case "tool_call", "tool_call_update":
             guard let id = update["toolCallId"].string else { return true }
             if let index = items.firstIndex(where: { $0.id == id && $0.kind == .tool }) {
@@ -97,24 +122,31 @@ final class AgentTurn: Identifiable {
             } else if hiddenTools[id] != nil || items.count >= Self.itemLimit {
                 entriesTruncated = true
                 guard hiddenTools[id] != nil || hiddenTools.count < Self.hiddenToolLimit else {
-                    eventLimitExceeded = true; revision += 1; return false
+                    eventLimitExceeded = true; return false
                 }
+                let isNew = hiddenTools[id] == nil
                 var tool = hiddenTools[id] ?? AgentTimelineItem(id: id, kind: .tool)
                 patch(&tool, update: update, root: projectRoot, retainDetails: false)
                 hiddenTools[id] = tool
-                fallbackMessageID = UUID().uuidString
+                if isNew { beginAnswer(after: id) }
             } else {
                 var tool = AgentTimelineItem(id: id, kind: .tool)
                 patch(&tool, update: update, root: projectRoot, retainDetails: true)
                 items.append(tool)
-                fallbackMessageID = UUID().uuidString
+                beginAnswer(after: id)
+            }
+            if latestToolID == id, let title = update["rawInput"]["command"].string ?? update["title"].string {
+                currentStepTitle = Self.prefix(title, bytes: 256)
             }
         case "plan":
+            if latestToolID == nil, let step = update["entries"].array.first(where: { $0["status"].string == "in_progress" }) {
+                currentStepTitle = Self.prefix(step["content"].string ?? "", bytes: 256)
+            }
             let text = update["entries"].array.compactMap { item -> String? in
                 guard let content = item["content"].string else { return nil }
                 return "\(item["status"].string ?? "pending"): \(content)"
             }.joined(separator: "\n")
-            if let index = items.firstIndex(where: { $0.id == "plan" }) {
+            if let index = items.firstIndex(where: { $0.kind == .notice && $0.id == "plan" }) {
                 items[index].text = Self.prefix(text, bytes: Self.textLimit)
                 items[index].textTruncated = text.utf8.count > Self.textLimit
             } else if !text.isEmpty, items.count < Self.itemLimit {
@@ -123,23 +155,27 @@ final class AgentTurn: Identifiable {
             } else if !text.isEmpty { entriesTruncated = true }
         default: return true
         }
-        revision += 1
         return true
     }
 
-    private func recordPath(_ value: ACPJSON, root: URL) {
-        guard !editedFilesTruncated, let path = value["path"].string,
-              let relative = AgentPaths.relativePath(path, root: root), !seenPaths.contains(relative) else { return }
-        guard editedFiles.count < Self.fileLimit else { editedFilesTruncated = true; return }
-        seenPaths.insert(relative)
-        editedFiles.append(relative)
+    private func beginAnswer(after id: String) {
+        answerStart = items.count
+        overflowAnswer = nil
+        fallbackMessageID = UUID().uuidString
+        latestToolID = id
+        currentStepTitle = "Tool call"
+    }
+
+    private static func append(_ text: String, to item: inout AgentTimelineItem) {
+        let remaining = max(0, textLimit - item.text.utf8.count)
+        item.text += prefix(text, bytes: remaining)
+        item.textTruncated = item.textTruncated || text.utf8.count > remaining
     }
 
     private func patch(_ item: inout AgentTimelineItem, update: ACPJSON, root: URL?, retainDetails: Bool) {
-        if let kind = update["kind"].string { item.editsFiles = ["edit", "delete", "move"].contains(kind) }
-        if item.editsFiles, let root, !editedFilesTruncated {
-            for location in update["locations"].array { recordPath(location, root: root) }
-            for content in update["content"].array where content["type"].string == "diff" { recordPath(content, root: root) }
+        if let kind = update["kind"].string { item.toolKind = kind }
+        if ["edit", "delete", "move"].contains(item.toolKind), let root {
+            changes.record(update, call: item.id, kind: item.toolKind, root: root)
         }
         if let status = update["status"].string { item.status = status }
         let meta = update["_meta"]

@@ -131,6 +131,163 @@ struct AgentCoreTests {
         let root = FileManager.default.temporaryDirectory.appending(path: "silica-agent-tests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        func json(_ source: String) throws -> ACPJSON { try JSONDecoder().decode(ACPJSON.self, from: Data(source.utf8)) }
+        let claudeResult = try json(#"{"usage":{"inputTokens":2,"outputTokens":4,"cachedReadTokens":9273,"cachedWriteTokens":5783,"totalTokens":15062},"_meta":{"quota":{"token_count":{},"model_usage":[]}}}"#)
+        let claudeUsage = AgentTurnUsage(claudeResult)
+        check(claudeUsage?.inputTokens == 2 && claudeUsage?.outputTokens == 4 && claudeUsage?.cachedReadTokens == 9273 &&
+              claudeUsage?.cachedWriteTokens == 5783 && claudeUsage?.totalTokens == 15062 && claudeUsage?.reasoningOutputTokens == nil,
+              "Claude prompt result lost cache usage or invented reasoning")
+        let codexResult = try json(#"{"usage":{"inputTokens":9,"outputTokens":12,"cachedReadTokens":19,"cachedWriteTokens":0,"totalTokens":40},"_meta":{"quota":{"token_count":{"reasoningOutputTokens":7,"cachedInputTokens":99},"model_usage":[]}}}"#)
+        let codexUsage = AgentTurnUsage(codexResult)
+        check(codexUsage?.totalTokens == 40 && codexUsage?.cachedReadTokens == 19 && codexUsage?.reasoningOutputTokens == 7,
+              "Codex usage must use the prompt result and the quota reasoning count")
+        check(AgentTurnUsage(.null) == nil, "Missing usage became a zero-token turn")
+        check([999, 15062, 1_000_000].map(compactTokenCount) == ["999", "15K", "1M"], "Compact context token labels")
+        check(claudeUsage?.cacheHitFraction == 9273.0 / (2 + 9273 + 5783), "Incorrect cache hit denominator")
+        for fields in [#""cachedReadTokens":0,"cachedWriteTokens":0"#, #""cachedReadTokens":1"#, #""cachedWriteTokens":1"#] {
+            let result = try json("{\"usage\":{\"inputTokens\":0,\"outputTokens\":1,\"totalTokens\":1," + fields + "}}")
+            check(AgentTurnUsage(result)?.cacheHitFraction == nil, "Incomplete cache accounting displayed a percentage")
+        }
+
+        let promptRoot = root.appending(path: "mentions", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: promptRoot, withIntermediateDirectories: true)
+        let note = promptRoot.appending(path: "note.txt")
+        let spaced = promptRoot.appending(path: "two words.txt")
+        try Data("hello".utf8).write(to: note)
+        try Data().write(to: spaced)
+        try Data().write(to: promptRoot.appending(path: "two"))
+        let siblingFile = root.appending(path: "external.txt")
+        try Data().write(to: siblingFile)
+        try FileManager.default.createSymbolicLink(at: promptRoot.appending(path: "escape"), withDestinationURL: siblingFile)
+        let allCapabilities = AgentPromptCapabilities(image: true, embeddedContext: true)
+        func promptBlocks(_ text: String, files: [AgentAttachment] = [], capabilities: AgentPromptCapabilities = .init()) throws -> [ACPJSON] {
+            try AgentPrompt.blocks(text: text, root: promptRoot, attachments: files, capabilities: capabilities) { AgentPrompt.projectFile($0, root: promptRoot) }
+        }
+        let raw = "  See @note.txt @missing @../external.txt @escape @. and @two words.txt  "
+        let normal = try promptBlocks(raw)
+        check(normal.first?["text"].string?.hasPrefix("Workspace: ") == true && normal.first?["text"].string?.hasSuffix(raw) == true,
+              "A normal prompt lost its workspace prefix or draft whitespace")
+        check(normal.dropFirst().map { $0["type"].string } == ["resource_link", "resource_link"] &&
+              normal.dropFirst().map { $0["name"].string } == ["note.txt", "two words.txt"], "Unresolved, directory or external mentions leaked")
+        let absolute = try promptBlocks("@\(note.path) @\(siblingFile.path)")
+        check(absolute.count == 2 && absolute[1]["name"].string == "note.txt", "Absolute mentions must stay within the project")
+        let command = try promptBlocks("/review @note.txt")
+        check(command.first?["text"].string == "/review @note.txt" && command[1]["uri"].string == note.resolvingSymlinksInPath().absoluteString,
+              "Slash command was prefixed or lost the file URL")
+        let imageData = Data([1, 2, 3])
+        let picture = AgentAttachment(name: "Pasted image", url: nil, byteCount: imageData.count, content: .image(imageData, mime: "image/png"))
+        let embedded = try promptBlocks("files", files: [picture, AgentAttachment.file(note)], capabilities: allCapabilities)
+        check(embedded[1] == .object(["type": .string("image"), "mimeType": .string("image/png"), "data": .string("AQID")]),
+              "Image bytes or MIME type lost")
+        check(embedded[2]["type"].string == "resource" && embedded[2]["resource"]["text"].string == "hello" &&
+              embedded[2]["resource"]["uri"].string == note.absoluteString, "Text file was not embedded")
+        let linked = try promptBlocks("file", files: [AgentAttachment.file(note)])
+        check(linked[1]["type"].string == "resource_link" && linked[1]["name"].string == "note.txt", "Unsupported embedded text must link")
+        let pdf = promptRoot.appending(path: "diagram.pdf")
+        try Data("%PDF-1.4".utf8).write(to: pdf)
+        let binary = try promptBlocks("file", files: [AgentAttachment.file(pdf)], capabilities: allCapabilities)
+        check(binary[1]["type"].string == "resource_link", "Binary file with ASCII bytes was embedded as text")
+        let largeNote = promptRoot.appending(path: "large.txt")
+        try Data(repeating: 65, count: AgentPrompt.textLimit + 1).write(to: largeNote)
+        let largeBlocks = try promptBlocks("file", files: [AgentAttachment.file(largeNote)], capabilities: allCapabilities)
+        check(largeBlocks[1]["type"].string == "resource_link", "Oversized text must link")
+        func rejects(_ files: [AgentAttachment], _ capabilities: AgentPromptCapabilities, reason: String) {
+            do { _ = try promptBlocks("file", files: files, capabilities: capabilities); preconditionFailure("Accepted invalid attachments") }
+            catch { check(error.localizedDescription.contains(reason), "Unexpected rejection: \(error.localizedDescription)") }
+        }
+        rejects([picture], .init(), reason: "does not accept image")
+        rejects(Array(repeating: picture, count: 11), allCapabilities, reason: "10 files")
+        let oversized = Data(count: AgentPrompt.imageLimit + 1)
+        rejects([.init(name: "large.png", url: nil, byteCount: oversized.count, content: .image(oversized, mime: "image/png"))],
+                allCapabilities, reason: "5 MB")
+        let bigLink = AgentAttachment(name: "large.bin", url: note, byteCount: AgentPrompt.totalLimit, content: .link)
+        rejects([bigLink, picture], allCapabilities, reason: "10 MB")
+        var session = AgentSessionInfo()
+        session.apply(try json(#"{"sessionUpdate":"usage_update","used":15062,"size":1000000,"cost":{"amount":0.035,"currency":"USD"},"_meta":{"_claude/model":"sonnet","_claude/rateLimit":{"status":"allowed","utilization":0.2}}}"#))
+        check(session.context?.cost?.amount == 0.035 && session.context?.model == "sonnet" && session.context?.used == 15062,
+              "Claude context snapshot lost cost or model")
+        session.apply(try json(#"{"sessionUpdate":"usage_update","used":324,"size":8000}"#))
+        check(session.context?.used == 324 && session.context?.size == 8000 && session.context?.cost == nil && session.context?.model == nil &&
+              session.rateLimit?.utilization == 0.2, "Compaction must replace the context snapshot and retain the last rate limit")
+
+        let conversation = AgentTurn(number: 1, prompt: "transcript")
+        func chunk(_ text: String, _ id: String = "assistant") {
+            conversation.apply(.object(["sessionUpdate": .string("agent_message_chunk"), "messageId": .string(id),
+                                        "content": .object(["text": .string(text)])]))
+        }
+        func step(_ id: String) {
+            conversation.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string(id)]))
+        }
+        chunk("First"); chunk(" message", "two")
+        check(conversation.transcript.work.isEmpty && conversation.transcript.answer.map(\.text) == ["First", " message"], "Text-only turn lost answer text")
+        step("read")
+        check(conversation.transcript.answer.isEmpty && conversation.transcript.work.map(\.text) == ["First", " message", ""],
+              "New tool must move previous text into work in order")
+        chunk("Next"); chunk(" part")
+        check(conversation.transcript.answer.map(\.text) == ["Next part"], "Reused message ID across a tool corrupted the streaming answer")
+        conversation.apply(try json(#"{"sessionUpdate":"tool_call_update","toolCallId":"read","status":"completed"}"#))
+        check(conversation.transcript.answer.map(\.text) == ["Next part"], "Updating an existing tool moved the answer")
+        step("edit"); chunk("Final")
+        check(conversation.transcript.work.map(\.text) == ["First", " message", "", "Next part", ""] &&
+              conversation.transcript.answer.map(\.text) == ["Final"], "Intermediate text escaped the work log")
+
+        let markdown = """
+        # Heading
+
+        2. outer
+           - nested
+
+        ```swift
+        let a = 1
+        ```
+
+        | Name | Value |
+        | ---- | ----- |
+        | file | [open](File.swift:2) |
+        """
+        let blocks = await AgentMarkdownBlock.parse(markdown)
+        guard blocks.count == 4, case let .heading(1, heading) = blocks[0],
+              case let .list(2, list) = blocks[1], list.first?.count == 2, case .list(nil, _) = list[0][1],
+              case let .code("swift", code) = blocks[2], case let .table(rows) = blocks[3] else {
+            preconditionFailure("Heading, nested list, fence or table lost in Markdown mapping")
+        }
+        check(heading.characters.elementsEqual("Heading") && code == "let a = 1\n" && rows.count == 2 &&
+              rows[1][1].link?.relativeString == "./File.swift:2", "Block content or project link changed while rendering")
+
+        var changes = AgentChanges()
+        func diff(_ call: String, path: String, old: ACPJSON, new: String, kind: String = "edit") {
+            let content: ACPJSON = .object(["type": .string("diff"), "path": .string(path), "oldText": old, "newText": .string(new)])
+            changes.record(.object(["content": .array([content])]), call: call, kind: kind, root: root)
+        }
+        diff("create", path: "added", old: .null, new: "a\r\n\r\n")
+        diff("remove", path: "deleted", old: .string("a\nb"), new: "", kind: "delete")
+        diff("first", path: "existing", old: .string("a\nb\nc"), new: "a\nz\nc")
+        diff("second", path: "existing", old: .string("z"), new: "a\nb")
+        diff("second", path: "existing", old: .string("z"), new: "a\nb")
+        check(changes.files[0].counts == .init(added: 2, removed: 0) && changes.files[0].label == "new",
+              "New file should count empty lines and CRLF correctly")
+        check(changes.files[1].counts == .init(added: 0, removed: 2) && changes.files[1].label == "deleted", "Wrong delete stats")
+        check(changes.files[2].counts == .init(added: 3, removed: 2), "Multiple edits must sum across calls and replace within a call")
+        diff("second", path: "existing", old: .string("z"), new: "z\nb")
+        check(changes.files[2].counts == .init(added: 2, removed: 1), "Corrected diff did not replace its predecessor")
+        diff("large", path: "bytes", old: .string(String(repeating: "x", count: 2_097_153)), new: "x")
+        diff("large", path: "lines", old: .null, new: String(repeating: "a\n", count: 20_001))
+        changes.record(.object(["locations": .array([.object(["path": .string("location")])])]), call: "move", kind: "move", root: root)
+        check(changes.files.suffix(3).allSatisfy { $0.counts == nil }, "Oversized diffs and location-only paths must keep unknown counts")
+
+        var largeLines = (0..<20_000).map { "line \($0)" }
+        let original = ACPJSON.string(largeLines.joined(separator: "\n"))
+        let rewrite = (0..<20_000).map { "rewritten \($0)" }.joined(separator: "\n")
+        let elapsed = ContinuousClock().measure {
+            diff("rewrite", path: "rewrite", old: original, new: rewrite)
+        }
+        check(elapsed < .milliseconds(250), "20,000-line rewrite took \(elapsed)")
+        check(changes.files.last?.counts == .init(added: 20_000, removed: 20_000), "Wrong counts for a full rewrite")
+        largeLines[10_000] = "first replacement"
+        largeLines[10_002] = "second replacement"
+        diff("middle", path: "middle", old: original, new: largeLines.joined(separator: "\n"))
+        check(changes.files.last?.counts == .init(added: 2, removed: 2), "Small middle diff counted an unchanged interior line")
+
         let decisions: [(AgentKind, [String], String?, AgentKind.ModeDecision)] = [
             (.codex, [], nil, .keep),
             (.claude, [], nil, .fail),
@@ -171,7 +328,7 @@ struct AgentCoreTests {
             "locations": .array([.object(["path": .string(path), "line": .number(1)])])]), projectRoot: root)
         claude.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("toolu_edit"), "status": .string("completed"),
             "content": .array([.object(["type": .string("diff"), "path": .string(path), "oldText": .string("old"), "newText": .string("new")])])]), projectRoot: root)
-        check(claude.editedFiles == ["main.swift"], "Claude edit locations and diff paths should yield one project file")
+        check(claude.changes.paths == ["main.swift"], "Claude edit locations and diff paths should yield one project file")
         claude.apply(.object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("toolu_bash"), "kind": .string("execute"),
             "title": .string("Bash"), "rawInput": .object(["command": .string("pwd")])]))
         claude.apply(.object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("toolu_bash"), "status": .string("completed"),
@@ -211,10 +368,10 @@ struct AgentCoreTests {
         editEvent("tool_call_update", "delete", "delete", diffs: ["deleted"])
         editEvent("tool_call", "rename", "move", locations: ["old", "new"])
         for kind in ["read", "execute"] { editEvent("tool_call", kind, kind, locations: ["ignored"], diffs: ["ignored"]) }
-        check(turn.editedFiles == ["one", "two", "three", "deleted", "old", "new"],
-              "Incorrect project-relative edited files or order: \(turn.editedFiles)")
+        check(turn.changes.paths == ["one", "two", "three", "deleted", "old", "new"],
+              "Incorrect project-relative edited files or order: \(turn.changes.paths)")
         editEvent("tool_call_update", "patch", nil, locations: (0..<501).map { "file-\($0)" })
-        check(turn.editedFiles.count == 500 && turn.editedFiles.last == "file-493" && turn.editedFilesTruncated,
+        check(turn.changes.paths.count == 500 && turn.changes.paths.last == "file-493" && turn.changes.truncated,
               "Edited file cap did not preserve the first 500 paths")
 
         let transport = ACPTransport()
@@ -262,7 +419,7 @@ struct AgentCoreTests {
             let later = try Data(contentsOf: heartbeat)
             check(frozen == later, "\(method): a child continued writing after shutdown returned")
         }
-        print("PASS: \(count) panel sizing, agent preferences, discovery, mode policy, ACP framing, ordered dispatch, RPC, tool events, process cleanup and edited-file checks")
+        print("PASS: \(count) panel sizing, agent preferences, discovery, mode policy, ACP framing, ordered dispatch, RPC, tool events, process cleanup, usage, transcript, Markdown, change-stat and prompt-block checks")
     }
 
     nonisolated static func isRunning(_ pid: Int32) -> Bool {

@@ -26,7 +26,7 @@ final class QuickOpenModel {
     var selectedIndex = 0
     private(set) var isIndexing = false
 
-    @ObservationIgnored private var items: [QuickOpenItem] = [] {
+    private var items: [QuickOpenItem] = [] {
         didSet { indexedURLs = Set(items.map(\.url)) }
     }
     @ObservationIgnored private var indexedURLs: Set<URL> = []
@@ -48,7 +48,7 @@ final class QuickOpenModel {
         self.activeFile = activeFile
         self.query = query
         presentationCount += 1
-        reindex(activeFile: activeFile)
+        reindex()
     }
 
     /// From a trailing ":42" in the query: the line to go to.
@@ -93,22 +93,32 @@ final class QuickOpenModel {
         if query.isEmpty {
             results = defaultResults()
         } else {
-            var matches: [(QuickOpenItem, FuzzyMatch)] = []
-            for item in items + ignoredRecentItems() {
-                if let match = FuzzyMatcher.match(query, in: item) {
-                    matches.append((item, match))
-                }
-            }
-            matches.sort { lhs, rhs in
-                if lhs.1.score != rhs.1.score { return lhs.1.score > rhs.1.score }
-                if lhs.0.path.count != rhs.0.path.count { return lhs.0.path.count < rhs.0.path.count }
-                return lhs.0.path < rhs.0.path
-            }
-            results = matches.prefix(Self.resultLimit).map {
-                QuickOpenResult(item: $0.0, positions: $0.1.positions, isRecent: false)
-            }
+            results = rankedResults(query, limit: Self.resultLimit)
         }
         selectedIndex = 0
+    }
+
+    func mentionFiles(matching text: String, limit: Int) -> [String] {
+        let query = FuzzyMatcher.prepare(text)
+        if query.isEmpty { return items.prefix(limit).map(\.path) }
+        return rankedResults(query, limit: limit).map { $0.item.path }
+    }
+
+    private func rankedResults(_ query: [UInt32], limit: Int) -> [QuickOpenResult] {
+        var matches: [(QuickOpenItem, FuzzyMatch)] = []
+        for item in items + ignoredRecentItems() {
+            if let match = FuzzyMatcher.match(query, in: item) {
+                matches.append((item, match))
+            }
+        }
+        matches.sort { lhs, rhs in
+            if lhs.1.score != rhs.1.score { return lhs.1.score > rhs.1.score }
+            if lhs.0.path.count != rhs.0.path.count { return lhs.0.path.count < rhs.0.path.count }
+            return lhs.0.path < rhs.0.path
+        }
+        return matches.prefix(limit).map {
+            QuickOpenResult(item: $0.0, positions: $0.1.positions, isRecent: false)
+        }
     }
 
     /// With no query: recently opened files (except the current one), then the rest by path.
@@ -139,7 +149,7 @@ final class QuickOpenModel {
 
     // MARK: Index
 
-    private func reindex(activeFile: URL?) {
+    func reindex() {
         indexTask?.cancel()
         isIndexing = true
         let root = rootURL

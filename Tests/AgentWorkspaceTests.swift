@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Darwin
 @testable import Silica
 
@@ -63,9 +64,123 @@ struct AgentWorkspaceTests {
         viewer.refresh()
         check(viewer.activeBuffer?.textController?.textView.string == "restored\n", "Recreated file did not reload")
 
+        let composer = AgentComposerTextView(frame: .init(x: 0, y: 0, width: 200, height: 60))
+        var sends = 0
+        composer.send = { sends += 1 }
+        func pressReturn(_ modifiers: NSEvent.ModifierFlags = []) {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                                         timestamp: 0, windowNumber: 0, context: nil, characters: "\r",
+                                         charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+            composer.keyDown(with: event)
+        }
+        pressReturn()
+        check(sends == 1 && composer.string.isEmpty, "Return must submit")
+        pressReturn(.shift)
+        check(sends == 1 && composer.string == "\n", "Shift-Return must insert a newline")
+        pressReturn(.command)
+        check(sends == 2, "Command-Return must submit")
+        composer.setMarkedText("拼", selectedRange: NSRange(location: 1, length: 0),
+                               replacementRange: NSRange(location: NSNotFound, length: 0))
+        check(composer.hasMarkedText(), "Composer IME fixture must have marked text")
+        pressReturn()
+        check(sends == 2 && composer.string == "\n拼" && !composer.hasMarkedText(), "IME Return must only commit the marked text")
+
         let fixture = CommandLine.arguments[1]
         viewer.agent.selectAgent(.codex)
         viewer.agent.executablePath = fixture
+        let agent = viewer.agent
+        agent.connect()
+        try await waitUntil { agent.isConnected && !agent.isConnecting && agent.contextUsage != nil }
+        check(agent.turns.isEmpty && agent.availableCommands.map(\.name) == ["review"] &&
+              agent.availableCommands.first?.description == "Review a file" && agent.availableCommands.first?.hint == "path",
+              "Commands published before session/new returned were lost")
+        check(agent.sessionTitle == "Fixture chat" && agent.contextUsage?.used == 17000 && agent.contextUsage?.size == 1000000 &&
+              agent.accountPlan == "team" && agent.promptCapabilities.image && agent.promptCapabilities.embeddedContext,
+              "Session initialization missed title, context, plan or prompt capabilities")
+        let composerWindow = NSWindow(contentRect: .init(x: 0, y: 0, width: 300, height: 320),
+                                      styleMask: .borderless, backing: .buffered, defer: true)
+        let host = NSHostingView(rootView: AgentComposerView(model: agent, index: viewer.quickOpen, focusRequest: 0)
+            .frame(width: 300))
+        composerWindow.contentView = host
+        func findInput(_ view: NSView) -> AgentComposerTextView? {
+            if let input = view as? AgentComposerTextView { return input }
+            return view.subviews.lazy.compactMap(findInput).first
+        }
+        try await waitUntil { host.layoutSubtreeIfNeeded(); return findInput(host)?.enclosingScrollView != nil }
+        let input = findInput(host)!
+        try await waitUntil { composerWindow.firstResponder === input }
+        let scroll = input.enclosingScrollView!
+        input.insertText("x", replacementRange: input.selectedRange())
+        try await waitUntil { host.layoutSubtreeIfNeeded(); return scroll.frame.height > 0 && agent.draft == "x" }
+        let oneLine = scroll.frame.height
+        input.insertText(String(repeating: "\nline", count: 20), replacementRange: input.selectedRange())
+        try await waitUntil { host.layoutSubtreeIfNeeded(); return scroll.frame.height > oneLine }
+        check(scroll.frame.height <= 8 * input.layoutManager!.defaultLineHeight(for: input.font!) + 5
+              && input.frame.height > scroll.frame.height && scroll.frame.width <= 300,
+              "Narrow composer must grow to eight lines and scroll")
+        input.insertText("@ftxt", replacementRange: NSRange(location: 0, length: (input.string as NSString).length))
+        try await waitUntil { !viewer.quickOpen.isIndexing && input.suggestionKey(48) }
+        check(agent.draft == "@file.txt ", "Tab did not complete the fuzzy file mention")
+        input.insertText("/rev", replacementRange: NSRange(location: 0, length: (input.string as NSString).length))
+        check(input.suggestionKey(53) && !input.suggestionKey(48), "Esc did not dismiss command suggestions")
+        input.insertText("i", replacementRange: input.selectedRange())
+        check(input.suggestionKey(36) && agent.draft == "/review ", "Return did not complete the command")
+        composerWindow.contentView = nil
+
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        let pictureURL = root.appending(path: "fixture.png")
+        try Data(base64Encoded: png)!.write(to: pictureURL)
+        let picture = try AgentAttachment.file(pictureURL)
+        try agent.attach(picture)
+        agent.draft = "/review @file.txt fixture:summary"
+        agent.send()
+        try await waitUntil { !agent.isBusy }
+        let params = try JSONDecoder().decode(ACPJSON.self, from: Data(contentsOf: project.appending(path: "prompt.json")))
+        let blocks = params["prompt"].array
+        check(blocks.count == 3 && blocks[0]["text"].string == "/review @file.txt fixture:summary" &&
+              blocks[1]["type"].string == "resource_link" && blocks[1]["uri"].string == file.resolvingSymlinksInPath().absoluteString &&
+              blocks[2] == .object(["type": .string("image"), "mimeType": .string("image/png"), "data": .string(png)]),
+              "Session did not transmit the command, mention and image in order")
+        check(agent.attachments.isEmpty && agent.draft.isEmpty, "Successful send retained draft attachments")
+        let summary = agent.turns[0]
+        check(summary.transcript.answer.map(\.text) == ["Created [new.txt](new.txt:2)."] && summary.transcript.work.count == 2 &&
+              summary.changes.files.first?.counts == .init(added: 2, removed: 0), "Turn lost its transcript split or edit")
+        check(agent.sessionTitle == "Edited file" && agent.contextUsage?.used == 15062 && agent.contextUsage?.model == "fixture-model" &&
+              agent.contextUsage?.cost?.amount == 0.03 && agent.rateLimit?.resetsAt == 12345 &&
+              agent.rateLimit?.status == "allowed" && agent.rateLimit?.rateLimitType == "five_hour", "Lost latest session metadata")
+        check(summary.usage?.totalTokens == 15062 && summary.usage?.reasoningOutputTokens == 0 && summary.cost?.currency == "USD" &&
+              summary.cost?.amount == 0.03, "Turn did not settle once with the latest cost and prompt usage")
+        agent.disconnect()
+        try await waitUntil { !agent.isConnecting }
+        agent.connect()
+        try await waitUntil { !agent.isConnecting }
+        check(agent.isConnected && agent.contextUsage?.used == 15062 && agent.rateLimit?.utilization == 0.1 &&
+              agent.sessionTitle == "Edited file" && agent.availableCommands.count == 1 && agent.turns.count == 1 && summary.items.count == 3,
+              "Loading the same session lost metadata or appended replayed events")
+        let replacement = project.appending(path: "replacement-session")
+        try Data().write(to: replacement)
+        agent.disconnect()
+        try await waitUntil { !agent.isConnecting }
+        agent.connect()
+        try await waitUntil { !agent.isConnecting }
+        check(agent.isConnected && agent.contextUsage == nil && agent.rateLimit == nil && agent.sessionTitle == nil &&
+              agent.availableCommands.isEmpty && agent.accountPlan == nil, "A different session inherited old metadata")
+        try FileManager.default.removeItem(at: replacement)
+        agent.newChat()
+        agent.connect()
+        try await waitUntil { !agent.isConnecting }
+        check(agent.contextUsage != nil && agent.accountPlan != nil, "Fresh session did not populate its own state")
+        agent.newChat()
+        check(agent.contextUsage == nil && agent.sessionTitle == nil && agent.availableCommands.isEmpty && agent.accountPlan == nil &&
+              agent.rateLimit == nil && !agent.promptCapabilities.image && !agent.promptCapabilities.embeddedContext && agent.turns.isEmpty,
+              "New Chat retained session state")
+        try agent.attach(picture)
+        agent.draft = "fixture:reject"
+        agent.send()
+        try await waitUntil { !agent.isBusy }
+        check(agent.errorMessage?.contains("Fixture rejected prompt") == true && agent.attachments.map(\.id) == [picture.id]
+              && agent.draft == "fixture:reject", "Failed send discarded draft or attachments")
+        agent.newChat()
         viewer.agent.draft = "fixture:permission-edit"
         viewer.agent.send()
         try await waitUntil { !viewer.agent.permissions.isEmpty }
@@ -74,13 +189,14 @@ struct AgentWorkspaceTests {
         let permission = viewer.agent.permissions[0]
         viewer.agent.answer(permission, option: permission.options[0])
         try await waitUntil { !viewer.agent.isBusy }
-        check(viewer.agent.turns.first?.editedFiles == ["permission.txt"], "Lost edit path reported only in a permission request")
+        check(viewer.agent.turns.first?.changes.paths == ["permission.txt"], "Lost edit path reported only in a permission request")
         let claudeFixture = root.appending(path: "claude-fixture")
         try FileManager.default.copyItem(at: URL(filePath: fixture), to: claudeFixture)
         viewer.agent.draft = "unsent"
         viewer.agent.selectAgent(.claude)
         check(!viewer.agent.isConnected && viewer.agent.turns.isEmpty && viewer.agent.draft.isEmpty
-              && viewer.agent.configOptions.isEmpty && viewer.agent.agentVersion.isEmpty, "Switching agents retained Codex chat state")
+              && viewer.agent.configOptions.isEmpty && viewer.agent.agentVersion.isEmpty && viewer.agent.accountPlan == nil
+              && viewer.agent.contextUsage == nil && viewer.agent.sessionTitle == nil && viewer.agent.availableCommands.isEmpty, "Switching agents retained Codex chat state")
         check(viewer.agent.kind == .claude && viewer.agent.executablePath != fixture, "Claude inherited the Codex executable")
         viewer.agent.executablePath = claudeFixture.path
         viewer.agent.connect()
@@ -201,7 +317,7 @@ struct AgentWorkspaceTests {
                 check(turn.status == "Completed" && turn.omittedToolCount == 1 && turn.timelineNotice?.contains("1 failed") == true,
                       "Hidden terminal completion/failure was lost")
                 check(tryContents(folder.appending(path: "late.txt")) == "written before terminal exit\n", "Turn finished before the hidden terminal exited")
-                check(turn.editedFiles == ["edited.txt"], "Turn must list the ACP edit and omit the terminal write")
+                check(turn.changes.paths == ["edited.txt"], "Turn must list the ACP edit and omit the terminal write")
                 await workspace.agent.stopAndDisconnect()
             } else {
                 let expected = scenario == "disconnect" ? "interrupted" : "cancelled"
@@ -213,7 +329,7 @@ struct AgentWorkspaceTests {
                 check(frozen != nil && frozen == tryContents(folder.appending(path: "heartbeat")), "\(scenario): heartbeat changed after lease release")
             }
         }
-        print("PASS: \(count) read-only viewer, workspace lease, agent preferences and session lifecycle checks")
+        print("PASS: \(count) read-only viewer, workspace lease, agent preferences, session metadata, turn lifecycle, composer keys and prompt delivery checks")
     }
 
     @MainActor static func waitUntil(_ condition: () -> Bool) async throws {

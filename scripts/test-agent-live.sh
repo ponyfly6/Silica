@@ -16,6 +16,8 @@ trap 'rm -rf "$SILICA_TESTS"' EXIT
 xcrun swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
     "$SILICA_ROOT/Silica/Agent/Protocol/ACPJSON.swift" \
     "$SILICA_ROOT/Silica/Agent/Protocol/ACPTransport.swift" \
+    "$SILICA_ROOT/Silica/Agent/Models/AgentUsage.swift" \
+    "$SILICA_ROOT/Silica/Agent/Models/AgentChanges.swift" \
     "$SILICA_ROOT/Silica/Agent/Models/AgentTurn.swift" \
     "$SILICA_ROOT/Silica/Agent/Support/AgentKind.swift" \
     "$SILICA_ROOT/Silica/Agent/Support/AgentPaths.swift" \

@@ -70,11 +70,26 @@ for line in sys.stdin:
     method = request.get("method")
     ident = request.get("id")
     if method == "initialize":
-        respond(ident, {"protocolVersion": 1, "agentInfo": {"version": "offline"}, "agentCapabilities": {"loadSession": True}})
+        replacement = pathlib.Path("replacement-session").exists()
+        if replacement:
+            SESSION = "replacement"
+        respond(ident, {"protocolVersion": 1, "agentInfo": {"version": "offline"}, "agentCapabilities": {
+            "loadSession": not replacement, "promptCapabilities": {"image": True, "embeddedContext": True}}})
+        if not replacement:
+            emit({"jsonrpc": "2.0", "method": "_auth/status_update",
+                  "params": {"authStatus": {"kind": "authenticated", "label": "Fixture", "account": {"plan": "team"}}}})
     elif method in ("session/new", "session/load"):
         assert os.environ.get("INITIAL_AGENT_MODE") == (None if claude else "workspace-write")
         record(method)
         model, effort, mode = "standard", "medium", "bypassPermissions"
+        if method == "session/new" and not replacement:
+            update({"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "review", "description": "Review a file", "input": {"hint": "path"}}]})
+            update({"sessionUpdate": "session_info_update", "title": "Fixture chat"})
+            update({"sessionUpdate": "usage_update", "used": 17000, "size": 1000000})
+        elif method == "session/load":
+            update({"sessionUpdate": "agent_message_chunk", "content": {"text": "replayed message"}})
+            update({"sessionUpdate": "tool_call", "toolCallId": "replay", "kind": "read"})
         respond(ident, {"sessionId": SESSION, "configOptions": config_options()})
     elif method == "session/set_config_option":
         params = request["params"]
@@ -106,9 +121,12 @@ for line in sys.stdin:
             respond(pending_prompt, {"stopReason": "cancelled"})
             pending_prompt = None
     elif method == "session/prompt":
+        pathlib.Path("prompt.json").write_text(json.dumps(request["params"]))
         prompt = request["params"]["prompt"][0]["text"]
         ignore_cancel = "fixture:force-disconnect" in prompt
-        if "fixture:permission-edit" in prompt:
+        if "fixture:reject" in prompt:
+            emit({"jsonrpc": "2.0", "id": ident, "error": {"code": -32602, "message": "Fixture rejected prompt"}})
+        elif "fixture:permission-edit" in prompt:
             path = pathlib.Path("permission.txt")
             emit({"jsonrpc": "2.0", "id": "permission", "method": "session/request_permission",
                   "params": {"sessionId": SESSION,
@@ -118,6 +136,23 @@ for line in sys.stdin:
             if answer["result"]["outcome"].get("optionId") == "allow":
                 path.write_text("allowed\n")
             respond(ident, {"stopReason": "end_turn"})
+        elif "fixture:summary" in prompt:
+            update({"sessionUpdate": "session_info_update", "title": "Edited file"})
+            update({"sessionUpdate": "session_info_update"})
+            update({"sessionUpdate": "usage_update", "used": 16000, "size": 1000000, "cost": {"amount": 0.01, "currency": "USD"}})
+            update({"sessionUpdate": "usage_update", "used": 15062, "size": 1000000, "cost": {"amount": 0.03, "currency": "USD"},
+                    "_meta": {"_claude/model": "fixture-model", "_claude/origin": "main",
+                              "_claude/rateLimit": {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1, "resetsAt": 12345}}})
+            update({"sessionUpdate": "agent_message_chunk", "content": {"text": "Creating the file."}})
+            update({"sessionUpdate": "tool_call", "toolCallId": "write", "kind": "edit", "status": "completed",
+                    "content": [{"type": "diff", "path": "new.txt", "newText": "alpha\nbeta\n"}]})
+            pathlib.Path("new.txt").write_text("alpha\nbeta\n")
+            update({"sessionUpdate": "agent_message_chunk", "content": {"text": "Created [new.txt](new.txt:2)."}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "foreign", "update": {
+                "sessionUpdate": "usage_update", "used": 99, "size": 100}}})
+            respond(ident, {"stopReason": "end_turn", "usage": {"inputTokens": 2, "outputTokens": 4, "cachedReadTokens": 9273,
+                                                               "cachedWriteTokens": 5783, "totalTokens": 15062},
+                            "_meta": {"quota": {"token_count": {"reasoningOutputTokens": 0}, "model_usage": []}}})
         elif "fixture:overflow" in prompt:
             pathlib.Path("edited.txt").write_text("ACP edit\n")
             update({"sessionUpdate": "tool_call", "toolCallId": "edit", "kind": "edit",

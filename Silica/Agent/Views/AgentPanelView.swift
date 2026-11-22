@@ -4,24 +4,25 @@ struct AgentPanelView: View {
     @Bindable var model: AgentSessionModel
     let workspace: WorkspaceModel
     @State private var showsConnection = false
-    @State private var confirmsRelease = false
-    @FocusState private var isComposerFocused: Bool
+    @State private var isScrollingTranscript = false
+    @State private var focusRequest = 0
 
     var body: some View {
+        let title = model.sessionTitle.flatMap { $0.isEmpty ? nil : $0 } ?? model.kind.displayName
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "sparkle")
-                Picker("Agent", selection: Binding(get: { model.kind }, set: model.selectAgent)) {
-                    ForEach(AgentKind.allCases, id: \.self) { Text($0.displayName).tag($0) }
-                }
-                .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
-                .disabled(model.isBusy || model.isConnecting || !model.survivingProcessIDs.isEmpty)
-                .help("Switch agents and start a new chat in this window")
+                Circle().fill(model.isConnected ? Color.green : .secondary).frame(width: 6, height: 6)
+                    .help(model.statusLabel).accessibilityLabel(model.statusLabel)
+                Text(title).font(.callout.weight(.medium))
+                    .lineLimit(1).truncationMode(.tail).help(title)
                 Spacer(minLength: 0)
                 Button { model.newChat() } label: { Image(systemName: "square.and.pencil") }
                     .disabled(model.isBusy || model.isConnecting)
                     .help("New chat · clears this window’s in-memory conversation")
                     .accessibilityLabel("New \(model.kind.displayName) chat")
+                Button { showsConnection.toggle() } label: { Image(systemName: "gearshape") }
+                    .help("Connection settings").accessibilityLabel("Connection settings")
+                    .popover(isPresented: $showsConnection) { connectionSettings }
                 Button { workspace.toggleAgentPanel() } label: { Image(systemName: "sidebar.right") }
                     .help("Hide \(model.kind.displayName) (⌘R)").accessibilityLabel("Hide \(model.kind.displayName) panel")
             }
@@ -29,8 +30,6 @@ struct AgentPanelView: View {
             .frame(height: WorkspaceLayout.titleBarHeight).padding(.horizontal, 12)
 
             VStack(spacing: 0) {
-                connectionBar
-                Divider()
                 transcript
                 if let error = model.errorMessage {
                     Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
@@ -50,39 +49,30 @@ struct AgentPanelView: View {
                     .background(.orange.opacity(0.08))
                 }
                 Divider()
-                composer
+                AgentComposerView(model: model, index: workspace.quickOpen, focusRequest: focusRequest)
             }
             .glassEffect(.regular, in: .rect(cornerRadius: WorkspaceLayout.cardCornerRadius))
             .padding([.trailing, .bottom], WorkspaceLayout.cardInset)
         }
     }
 
-    private var connectionBar: some View {
+    private var connectionSettings: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Circle().fill(model.isConnected ? .green : .secondary).frame(width: 6, height: 6)
-                Text(model.statusLabel).font(.caption).lineLimit(2)
-                Spacer(minLength: 0)
-                if model.isConnecting || model.isBusy { ProgressView().controlSize(.mini) }
-                if !model.isBusy {
-                    Button(model.isConnected ? "Disconnect" : "Connect") {
-                        if model.isConnected { model.disconnect() } else { model.connect() }
-                    }
-                    .disabled(model.isConnecting).controlSize(.small)
+            Text("\(model.kind.displayName) connection").font(.headline)
+            TextField("\(model.kind.executableName) executable (auto-detect)", text: $model.executablePath)
+                .textFieldStyle(.roundedBorder).disabled(model.isConnected || model.isBusy || model.isConnecting)
+            Text("Adapter \(model.agentVersion.isEmpty ? "not connected" : model.agentVersion)")
+            Text(model.kind.loginHint).foregroundStyle(.secondary)
+            HStack {
+                Text(model.statusLabel).lineLimit(1)
+                Spacer()
+                Button(model.isConnected ? "Disconnect" : "Connect") {
+                    if model.isConnected { model.disconnect() } else { model.connect() }
                 }
-                Button { showsConnection.toggle() } label: { Image(systemName: "gearshape") }
-                    .buttonStyle(.borderless).help("Connection settings").accessibilityLabel("\(model.kind.displayName) connection settings")
-            }
-            if showsConnection {
-                TextField("\(model.kind.executableName) executable (auto-detect)", text: $model.executablePath)
-                    .textFieldStyle(.roundedBorder).disabled(model.isConnected || model.isBusy || model.isConnecting)
-                Text("Uses your existing \(model.kind.displayName) login. Adapter \(model.agentVersion.isEmpty ? "not connected" : model.agentVersion).")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text(model.kind.loginHint)
-                    .font(.caption).foregroundStyle(.secondary)
+                .disabled(model.isConnecting || model.isBusy)
             }
         }
-        .padding(10)
+        .font(.callout).padding(12).frame(width: 270)
     }
 
     private var transcript: some View {
@@ -98,84 +88,24 @@ struct AgentPanelView: View {
                         .font(.callout).foregroundStyle(.secondary).padding(.top, 18)
                     }
                     ForEach(model.turns) { turn in
-                        AgentTurnView(turn: turn, workspace: workspace)
+                        AgentTurnView(turn: turn, workspace: workspace) {
+                            model.draft = turn.prompt
+                            focusRequest += 1
+                        }
                     }
                     Color.clear.frame(height: 1).id("agent-bottom")
                 }
                 .padding(12)
             }
-            .onChange(of: model.turns.last?.revision) { proxy.scrollTo("agent-bottom", anchor: .bottom) }
-            .onChange(of: model.turns.count) { proxy.scrollTo("agent-bottom", anchor: .bottom) }
-            .onChange(of: model.turns.last?.endedAt) { proxy.scrollTo("agent-bottom", anchor: .bottom) }
-        }
-    }
-
-    @ViewBuilder private func configurationMenu(_ category: String, label: String) -> some View {
-        let option = model.configOptions.first { $0.category == category }
-        if let option {
-            let choices = option.choices.filter { category != "mode" || model.kind.allowedModes.contains($0.id) }
-            let selected = choices.first { $0.id == option.value }?.name ?? option.value
-            Menu {
-                Picker(option.name, selection: Binding(get: { option.value }, set: { model.setConfiguration(option, value: $0) })) {
-                    ForEach(choices) { choice in Text(choice.name).tag(choice.id) }
+            .onScrollPhaseChange { _, phase in isScrollingTranscript = phase != .idle }
+            .onScrollGeometryChange(for: TranscriptScroll.self) { geometry in
+                TranscriptScroll(height: geometry.contentSize.height,
+                                 bottomGap: geometry.contentSize.height - geometry.visibleRect.maxY)
+            } action: { previous, current in
+                if !isScrollingTranscript, current.height > previous.height, previous.bottomGap < 64, current.bottomGap > 0 {
+                    proxy.scrollTo("agent-bottom", anchor: .bottom)
                 }
-                .pickerStyle(.inline)
-            } label: {
-                Text(selected).lineLimit(1)
             }
-            .disabled(!model.isConnected || model.isBusy || model.isConnecting || choices.isEmpty)
-            .accessibilityLabel(label).accessibilityValue(selected)
-            .help("\(label): \(selected)")
-        } else if !model.isConnected {
-            Menu(label) {}.disabled(true)
-        }
-    }
-
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Message \(model.kind.displayName)").font(.caption).foregroundStyle(.secondary)
-            TextEditor(text: $model.draft)
-                .focused($isComposerFocused)
-                .task {
-                    // Let the native text view join the window before requesting focus.
-                    await Task.yield()
-                    guard !Task.isCancelled else { return }
-                    isComposerFocused = true
-                }
-                .font(.body).scrollContentBackground(.hidden)
-                .frame(minHeight: 60, idealHeight: 80, maxHeight: 120)
-                .padding(5).background(.primary.opacity(0.04), in: .rect(cornerRadius: 8))
-                .accessibilityLabel("Message \(model.kind.displayName)")
-            HStack(spacing: 4) {
-                Group {
-                    configurationMenu("model", label: "Model")
-                    configurationMenu("thought_level", label: "Reasoning")
-                    configurationMenu("mode", label: "Permissions")
-                }
-                .menuStyle(.borderlessButton).controlSize(.mini).font(.caption).lineLimit(1)
-                Spacer(minLength: 0)
-                Group {
-                    if !model.survivingProcessIDs.isEmpty {
-                        Button("Release Project…", role: .destructive) { confirmsRelease = true }.controlSize(.small)
-                    } else if model.canForceDisconnect {
-                        Button("End Connection", role: .destructive) { model.disconnect() }.controlSize(.small)
-                    } else if model.isBusy {
-                        Button("Stop") { model.stop() }.disabled(model.isStopping).controlSize(.small)
-                    } else {
-                        Button("Send") { model.send() }
-                            .buttonStyle(.borderedProminent).controlSize(.small)
-                            .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isConnecting)
-                    }
-                }
-                .fixedSize()
-            }
-        }
-        .padding(10)
-        .alert("Release the project while \(model.kind.displayName) processes are still running?", isPresented: $confirmsRelease) {
-            Button("Release Project", role: .destructive) { Task { await model.releaseSurvivingProcesses() } }
-            Button("Keep Waiting", role: .cancel) {}
-        } message: {
-            Text("Processes \(model.survivingProcessIDs.map(String.init).joined(separator: ", ")) ignored termination and may keep changing files. Releasing the project allows another task to start. Check them in Activity Monitor.")
         }
     }
 
@@ -189,71 +119,12 @@ struct AgentPanelView: View {
     }
 }
 
-private struct AgentTurnView: View {
-    let turn: AgentTurn
-    let workspace: WorkspaceModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Turn \(turn.number)").fontWeight(.medium)
-                Spacer()
-                Text(turn.status).foregroundStyle(.secondary)
-            }.font(.caption)
-            Text(turn.prompt).textSelection(.enabled).font(.callout)
-                .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                .background(.primary.opacity(0.05), in: .rect(cornerRadius: 8))
-            if let notice = turn.timelineNotice {
-                Text(notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            }
-            ForEach(turn.items) { item in
-                switch item.kind {
-                case .assistant:
-                    Text((try? AttributedString(markdown: item.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(item.text))
-                        .font(.callout).textSelection(.enabled)
-                        .environment(\.openURL, OpenURLAction { url in
-                            if url.scheme == "https" || url.scheme == "http" { return .systemAction }
-                            guard url.scheme == nil || url.isFileURL else { return .discarded }
-                            let target = url.path.hasPrefix("/") ? URL(filePath: url.path) : workspace.rootURL.appending(path: url.path)
-                            let root = workspace.rootURL.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-                            let components = target.resolvingSymlinksInPath().standardizedFileURL.pathComponents
-                            guard components.count > root.count, components.starts(with: root),
-                                  FileManager.default.fileExists(atPath: target.path) else { return .discarded }
-                            workspace.open(target)
-                            return .handled
-                        })
-                    if item.textTruncated { Text("Message truncated at 256 KiB").font(.caption).foregroundStyle(.secondary) }
-                case .notice:
-                    DisclosureGroup(item.title) { Text(item.text).font(.caption).textSelection(.enabled) }
-                    if item.textTruncated { Text("Details truncated at 256 KiB").font(.caption).foregroundStyle(.secondary) }
-                case .tool:
-                    AgentToolView(item: item)
-                }
-            }
-            if !turn.editedFiles.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Edited by agent · \(turn.editedFiles.count) \(turn.editedFiles.count == 1 ? "file" : "files")")
-                        .font(.caption).foregroundStyle(.secondary)
-                    ForEach(turn.editedFiles, id: \.self) { path in
-                        Button(path) {
-                            let url = workspace.rootURL.appending(path: path)
-                            workspace.open(url)
-                            workspace.reveal(url)
-                        }
-                        .buttonStyle(.link).font(.caption).lineLimit(2).truncationMode(.middle).help(path)
-                    }
-                    if turn.editedFilesTruncated {
-                        Text("Showing the first 500 files.").font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Text("Changes made through shell commands are not listed.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
+private struct TranscriptScroll: Equatable {
+    let height: CGFloat
+    let bottomGap: CGFloat
 }
 
-private struct AgentToolView: View {
+struct AgentToolView: View {
     let item: AgentTimelineItem
     private var awaitingExit: Bool { item.isAwaitingExit }
     private var symbol: String {

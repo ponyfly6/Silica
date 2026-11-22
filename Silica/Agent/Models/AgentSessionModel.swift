@@ -4,6 +4,8 @@ import Observation
 @Observable
 final class AgentSessionModel {
     var draft = ""
+    var attachments: [AgentAttachment] = []
+    var attachmentNotice: String?
     private(set) var kind: AgentKind
     var executablePath: String {
         didSet { UserDefaults.standard.set(executablePath, forKey: kind.executableKey) }
@@ -18,6 +20,16 @@ final class AgentSessionModel {
     private(set) var turns: [AgentTurn] = []
     private(set) var permissions: [AgentPermission] = []
     private(set) var configOptions: [AgentConfigOption] = []
+    private var sessionInfo = AgentSessionInfo()
+    var availableCommands: [AgentCommand] { sessionInfo.commands }
+    var sessionTitle: String? { sessionInfo.title }
+    var contextUsage: AgentContextUsage? { sessionInfo.context }
+    var rateLimit: AgentRateLimit? { sessionInfo.rateLimit }
+    private(set) var accountPlan: String?
+    private(set) var promptCapabilities = AgentPromptCapabilities()
+    // session/new may publish metadata before its response identifies the new session.
+    @ObservationIgnored private var startingSessions: [String: AgentSessionInfo]?
+    @ObservationIgnored private var connectionPlan: String?
     /// Owned processes that outlived cleanup. Only the user can release the project then.
     private(set) var survivingProcessIDs: [Int32] = []
     @ObservationIgnored private var releasedProcessIDs: [Int32] = []
@@ -75,6 +87,7 @@ final class AgentSessionModel {
         isConnecting = true; errorMessage = nil
         defer { isConnecting = false }
         releasedProcessIDs = []
+        connectionPlan = nil
         try await transport.start(executable: executable, cwd: workspace.rootURL.resolvingSymlinksInPath(), kind: kind)
         survivingProcessIDs = []
         let initialized = try await transport.request("initialize", params: .object([
@@ -85,6 +98,8 @@ final class AgentSessionModel {
         ]), timeout: .seconds(20))
         guard initialized["protocolVersion"].integer == 1 else { throw ACPError.message("The adapter did not negotiate ACP v1.") }
         agentVersion = initialized["agentInfo"]["version"].string ?? "unknown"
+        let capabilities = initialized["agentCapabilities"]["promptCapabilities"]
+        promptCapabilities = AgentPromptCapabilities(image: capabilities["image"].boolean, embeddedContext: capabilities["embeddedContext"].boolean)
         let response: ACPJSON
         do {
             if let sessionID, initialized["agentCapabilities"]["loadSession"].boolean {
@@ -92,10 +107,14 @@ final class AgentSessionModel {
                     "sessionId": .string(sessionID), "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
                 ]))
             } else {
+                startingSessions = [:]
+                defer { startingSessions = nil }
                 response = try await transport.request("session/new", params: .object([
                     "cwd": .string(workspace.rootURL.resolvingSymlinksInPath().path), "mcpServers": .array([])
                 ]))
                 sessionID = response["sessionId"].string
+                sessionInfo = sessionID.flatMap { startingSessions?[$0] } ?? AgentSessionInfo()
+                accountPlan = connectionPlan
             }
         } catch let error as ACPError {
             throw ACPError.message("\(error.localizedDescription) \(kind.loginHint)")
@@ -148,35 +167,59 @@ final class AgentSessionModel {
         }
     }
 
-    func send() {
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isBusy, !isConnecting, !prompt.isEmpty, !closed else { return }
-        guard prompt.utf8.count <= 32_768 else { errorMessage = "Keep a message under 32 KiB."; return }
-        guard turns.count < 100 else { errorMessage = "Silica keeps up to 100 turns in a chat. Start a new chat to continue."; return }
-        isBusy = true; isStopping = false; canForceDisconnect = false; errorMessage = nil
-        operation = Task { [weak self] in await self?.runTurn(prompt) }
+    func attach(_ attachment: AgentAttachment) throws {
+        try AgentPrompt.validate(attachments + [attachment], capabilities: isConnected ? promptCapabilities : nil)
+        attachments.append(attachment)
     }
 
-    private func runTurn(_ prompt: String) async {
+    var canSend: Bool {
+        !isBusy && !isConnecting && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+    }
+
+    func send() {
+        guard canSend, !closed else { return }
+        guard draft.utf8.count <= 32_768 else { errorMessage = "Keep a message under 32 KiB."; return }
+        guard turns.count < 100 else { errorMessage = "Silica keeps up to 100 turns in a chat. Start a new chat to continue."; return }
+        isBusy = true; isStopping = false; canForceDisconnect = false; errorMessage = nil
+        attachmentNotice = nil
+        let prompt = draft, files = attachments
+        operation = Task { [weak self] in await self?.runTurn(prompt, files: files) }
+    }
+
+    private func runTurn(_ prompt: String, files: [AgentAttachment]) async {
         guard let workspace else { isBusy = false; return }
         var lease: UUID?
         let root = workspace.rootURL
-        let turn = AgentTurn(number: turns.count + 1, prompt: prompt)
+        let turn = AgentTurn(number: turns.count + 1, prompt: prompt, attachmentNames: files.map(\.name))
         var failed = false
         var cancelled = false
         do {
             try await establishConnection()
             try Task.checkCancellation()
+            let blocks: [ACPJSON]
+            do {
+                blocks = try AgentPrompt.blocks(text: prompt, root: root, attachments: files, capabilities: promptCapabilities) {
+                    AgentPrompt.projectFile($0, root: root)
+                }
+            } catch {
+                attachmentNotice = error.localizedDescription
+                isBusy = false
+                return
+            }
             lease = try AgentWorkspaceCoordinator.shared.acquire(for: root)
             guard let sessionID else { throw ACPError.message("The agent session is missing.") }
-            currentTurn = turn; turns.append(turn); draft = ""
+            currentTurn = turn; turns.append(turn)
+            if draft == prompt { draft = "" }
             turn.status = "Running"
             let response = try await transport.request("session/prompt", params: .object([
-                "sessionId": .string(sessionID), "prompt": .array([
-                    .object(["type": .string("text"), "text": .string("Workspace: \(root.path). Finish commands before ending the task; this client does not support detached background jobs.\n\n" + prompt)])
-                ])
+                "sessionId": .string(sessionID), "prompt": .array(blocks)
             ]), timeout: nil)
+            if response["stopReason"].string != "cancelled" {
+                let sent = Set(files.map(\.id))
+                attachments.removeAll { sent.contains($0.id) }
+            }
             flushUpdates()
+            turn.usage = AgentTurnUsage(response)
             try Task.checkCancellation()
             // A prompt response is not evidence that a background command exited.
             while response["stopReason"].string != "cancelled", turn.hasUnfinishedCommands {
@@ -204,6 +247,7 @@ final class AgentSessionModel {
         stopTimer?.cancel(); stopTimer = nil
         flushUpdates(); cancelPermissions()
         if failed || cancelled || isStopping {
+            if currentTurn === turn, draft.isEmpty { draft = prompt }
             let finalStatus = turn.status
             turn.status = "Stopping processes…"
             await shutdownProcesses()
@@ -293,12 +337,13 @@ final class AgentSessionModel {
         guard !isBusy, !isConnecting else { return }
         operation?.cancel(); transport.close(); isConnected = false
         sessionID = nil; turns = []; configOptions = []; errorMessage = nil; agentVersion = ""
+        sessionInfo = AgentSessionInfo(); accountPlan = nil; promptCapabilities = AgentPromptCapabilities()
         if workspace?.isAgentPanelVisible == true { connect() }
     }
 
     func selectAgent(_ selected: AgentKind) {
         guard kind != selected, !isBusy, !isConnecting, survivingProcessIDs.isEmpty else { return }
-        draft = ""
+        draft = ""; attachments = []; attachmentNotice = nil
         kind = selected
         executablePath = UserDefaults.standard.string(forKey: selected.executableKey) ?? ""
         UserDefaults.standard.set(selected.rawValue, forKey: "selectedAgent")
@@ -312,12 +357,30 @@ final class AgentSessionModel {
     }
 
     private func receive(_ method: String, params: ACPJSON) {
-        guard method == "session/update", params["sessionId"].string == sessionID else { return }
-        let update = params["update"]
-        if update["sessionUpdate"].string == "config_option_update" {
-            if isConnected { applyConfiguration(update["configOptions"]) }
+        if method == "_auth/status_update" || method == "auth/status_update" {
+            if let plan = params["authStatus"]["account"]["plan"].string {
+                connectionPlan = plan
+                accountPlan = plan
+            }
+            return
         }
-        guard currentTurn != nil else { return } // Do not append session/load replay to a live turn.
+        guard method == "session/update", let id = params["sessionId"].string else { return }
+        let update = params["update"]
+        switch update["sessionUpdate"].string {
+        case "available_commands_update", "session_info_update", "usage_update":
+            if startingSessions != nil {
+                startingSessions?[id, default: AgentSessionInfo()].apply(update)
+            } else if id == sessionID {
+                sessionInfo.apply(update)
+                if update["sessionUpdate"].string == "usage_update", let cost = AgentCost(update["cost"]) { currentTurn?.cost = cost }
+            }
+            return
+        case "config_option_update":
+            if id == sessionID, isConnected { applyConfiguration(update["configOptions"]) }
+            return
+        default: break
+        }
+        guard id == sessionID, currentTurn != nil else { return } // Ignore session/load transcript replay.
         pendingUpdates.append(update)
         if pendingUpdates.count >= 128 { flushUpdates() }
         else if flushTask == nil {
